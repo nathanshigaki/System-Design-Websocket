@@ -1,0 +1,12 @@
+{
+  "name": "pulsews-distributed-system",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/load-test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
