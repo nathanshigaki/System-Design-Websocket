@@ -582,7 +582,7 @@ async function refreshCluster() {
 
     el.svgGw1Count.textContent = `${gw1} conexões`;
     el.svgGw2Count.textContent = `${gw2} conexões`;
-    el.svgRingCount.textContent = `Ring Buffer (${data.ringBufferSize}/${data.ringBufferCapacity})`;
+    el.svgRingCount.textContent = `• Ring Buffer (${data.ringBufferSize}/${data.ringBufferCapacity})`;
     el.svgSeqCount.textContent = `#seqId: ${data.currentSeqId}`;
 
     el.sessionList.innerHTML = '';
