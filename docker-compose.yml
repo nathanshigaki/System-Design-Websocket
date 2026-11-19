@@ -1,0 +1,127 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pulsews-postgres
+    environment:
+      POSTGRES_DB: pulsews
+      POSTGRES_USER: pulsews
+      POSTGRES_PASSWORD: pulsews
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulsews -d pulsews"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - pulsews-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: pulsews-redis
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - pulsews-net
+
+  gateway-1:
+    build:
+      context: .
+      dockerfile: src/gateway/Dockerfile
+    container_name: pulsews-gateway-1
+    environment:
+      GATEWAY_ID: gateway-1
+      PORT: 4001
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://pulsews:pulsews@postgres:5432/pulsews
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pulsews-net
+
+  gateway-2:
+    build:
+      context: .
+      dockerfile: src/gateway/Dockerfile
+    container_name: pulsews-gateway-2
+    environment:
+      GATEWAY_ID: gateway-2
+      PORT: 4002
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://pulsews:pulsews@postgres:5432/pulsews
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pulsews-net
+
+  worker-1:
+    build:
+      context: .
+      dockerfile: src/worker/Dockerfile
+    container_name: pulsews-worker-1
+    environment:
+      WORKER_ID: worker-1
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://pulsews:pulsews@postgres:5432/pulsews
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pulsews-net
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    container_name: pulsews-haproxy
+    ports:
+      - "8080:8080"
+      - "8404:8404"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - gateway-1
+      - gateway-2
+    networks:
+      - pulsews-net
+
+  web:
+    build:
+      context: .
+      dockerfile: src/web/Dockerfile
+    container_name: pulsews-web
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      LB_HOST: haproxy
+      LB_PORT: 8080
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://pulsews:pulsews@postgres:5432/pulsews
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      haproxy:
+        condition: service_started
+    networks:
+      - pulsews-net
+
+volumes:
+  pgdata:
+
+networks:
+  pulsews-net:
+    driver: bridge
