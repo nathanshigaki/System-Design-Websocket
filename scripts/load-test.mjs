@@ -141,7 +141,11 @@ async function run() {
   assert.equal(pollRes.status, 200);
   const pollData = await pollRes.json();
   assert.ok(Array.isArray(pollData.notifications) && pollData.notifications.length > 0);
-  console.log(`   Polling retornou ${pollData.notifications.length} notificacoes.`);
+  assert.ok(
+    pollData.notifications.every((n) => n.type !== 'message'),
+    'Short Polling should only contain presence/system notifications, not duplicate chat messages'
+  );
+  console.log(`   Polling retornou ${pollData.notifications.length} notificacoes de presenca.`);
 
   console.log('6) Testando /api/cluster e eventos recebidos em /ws-trace...');
   const clusterRes = await fetch(`${BASE_HTTP}/api/cluster`);

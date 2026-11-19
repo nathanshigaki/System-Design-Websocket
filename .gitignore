@@ -1,4 +1,6 @@
 node_modules/
+.agents/
+.taste-skill/
 .env
 *.log
 .DS_Store

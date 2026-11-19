@@ -65,16 +65,10 @@ async function handleChatJob(job) {
     detail: `INCR seq=${seqId} + Ring Buffer (${RING_BUFFER_SIZE} max)`,
   });
 
-  const preview = content.length > 48 ? `${content.slice(0, 48)}...` : content;
   await pgPool.query(
     `INSERT INTO messages (seq_id, user_id, content, gateway_id, created_at)
      VALUES ($1, $2, $3, $4, $5)`,
     [seqId, job.userId, content, job.gatewayId, createdAt]
-  );
-  await pgPool.query(
-    `INSERT INTO notifications (type, user_id, message, created_at)
-     VALUES ($1, $2, $3, $4)`,
-    ['message', job.userId, `${job.userId} enviou (#${seqId}): "${preview}"`, createdAt]
   );
 
   await emitHop({
@@ -84,7 +78,7 @@ async function handleChatJob(job) {
     from: 'worker',
     to: 'postgres',
     protocol: 'SQL INSERT',
-    detail: `Single-Writer gravou msg #${seqId} e notificacao`,
+    detail: `Single-Writer gravou msg #${seqId}`,
   });
 
   await redis.publish(ROOM_CHANNEL, JSON.stringify(event));
