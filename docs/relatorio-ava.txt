@@ -1,0 +1,310 @@
+========================================================================
+RELATORIO TECNICO - SISTEMAS DISTRIBUIDOS
+Titulo: Escalabilidade de WebSockets em Sistemas Distribuidos:
+        Desafios de Grande Volume, Arquitetura Desacoplada e
+        Comparativo com Short Polling
+Disciplina: Sistemas Distribuidos
+Integrantes do Grupo: [PREENCHER OS 4 NOMES DO GRUPO]
+Data: [PREENCHER DATA]
+========================================================================
+
+
+1. INTRODUCAO
+------------------------------------------------------------------------
+A demanda por interatividade imediata em aplicacoes web e moveis — como
+plataformas de mensagens instantaneas, sistemas de rastreamento em tempo
+real, editores colaborativos e corretoras financeiras — expos os limites
+do modelo classico da Web baseado em HTTP sincrono de requisicao e
+resposta (request-response). Embora o protocolo HTTP tenha sido projetado
+para escalar com facilidade por meio de servidores sem estado (stateless),
+ele nao oferece nativamente um mecanismo eficiente para que o servidor
+envie atualizacoes proativas ao cliente com latencia sub-segundo.
+
+Para viabilizar comunicacao bidirecional continua (full-duplex), o
+protocolo WebSocket estabelece um tunel TCP persistente a partir de um
+handshake HTTP Upgrade. Contudo, essa persistencia transforma o servidor
+em um componente com estado em memoria (stateful): cada usuario conectado
+mantem um socket vivo alocado a um processo especifico. Em cenarios de
+grande volume, escalar WebSockets deixa de ser apenas uma escolha de
+protocolo e passa a ser um problema complexo de Sistemas Distribuidos,
+envolvendo limites de sistema operacional, consumo de memoria, falhas em
+cascata na reconexao, roteamento entre nos e gargalos de transmissao em
+massa (fan-out).
+
+Este trabalho investiga os desafios da escalabilidade de WebSockets em
+alta escala e propoe uma arquitetura distribuida desacoplada, validada por
+um prototipo funcional conteinerizado com Docker Compose, integrando uma
+sala WebSocket multi-usuario, um modulo paralelo de notificacoes via
+Short Polling e uma visualizacao animada das rotas entre servidores.
+
+
+2. APRESENTACAO DO PROBLEMA (JUSTIFICATIVA)
+------------------------------------------------------------------------
+Quando um sistema de comunicacao em tempo real precisa atender de
+centenas de milhares a milhoes de usuarios simultaneos, abordagens
+simplistas enfrentam barreiras tecnicas severas tanto no uso de Polling
+quanto no escalonamento de servidores WebSocket.
+
+2.1 Ineficiencia do Short Polling em Alta Concorrencia
+No modelo de Short Polling, os clientes disparam requisicoes HTTP
+periodicas (por exemplo, a cada poucos segundos) para verificar se ha
+novas mensagens ou eventos. Em pequena escala, essa abordagem e simples e
+adequada. Porem, sob grande volume de usuarios concorrentes, a maioria
+das requisicoes retorna vazia por nao haver novos dados ("requisicoes
+fantasmas"). Esse padrao gera trafego redundante de cabecalhos HTTP,
+esgota conexoes e desperdiça processamento e I/O no banco de dados com
+consultas improdutivas, tornando-se inviavel para fluxos de baixa
+latencia.
+
+2.2 Gargalos da Escalabilidade de WebSockets em Grande Volume
+Ao migrar para WebSockets, o fato de cada conexao permanecer aberta e
+stateful introduz cinco problemas criticos quando o volume de conexoes e
+mensagens cresce:
+
+a) Limites de Hardware, Sistema Operacional e Memoria (Bare-Metal):
+   Em sistemas Unix/Linux, cada socket TCP aberto corresponde a um
+   descritor de arquivo (file descriptor). O limite padrao por processo
+   e limitado (tipicamente na casa de dezenas de milhares, como ~65 mil)
+   e exige ajuste de parametros do kernel (como fs.file-max) para evitar
+   descarte silencioso de novas conexoes. Alem disso, cada conexao
+   WebSocket ociosa aloca buffers de leitura e escrita no kernel de
+   aproximadamente 50 KB; em 1 milhao de conexoes simultaneas, apenas os
+   sockets consomem cerca de 50 GB de RAM. Quando se utiliza TLS (WSS),
+   os buffers criptograficos praticamente dobram essa pegada de memoria
+   (cerca de 100 GB para 1 milhao de conexoes). Mesmo em servidores
+   robustos (por exemplo, 16 nucleos e 32 GB de RAM processando ~100 mil
+   mensagens/s), o teto pratico gira em torno de 300 mil a 500 mil
+   conexoes simultaneas por maquina.
+
+b) Raio de Explosao (Blast Radius) e Quedas Simultaneas:
+   Concentrar centenas de milhares de conexoes em um unico servidor cria
+   um ponto unico de falha critico. Se esse no falhar ou reiniciar,
+   todos os clientes desconectam ao mesmo tempo e tentam reconectar e
+   autenticar simultaneamente, gerando uma tempestade de reconexoes
+   (thundering herd) capaz de derrubar os servicos de autenticacao.
+
+c) Armadilha de Proxies Layer 7 (HTTP) e Idle Timeouts:
+   Load Balancers tradicionais operam na Camada 7 (L7), inspecionando
+   cabecalhos HTTP. Como conexoes WebSocket podem permanecer longos
+   periodos apenas recebendo dados ou ociosas (um usuario lendo um chat
+   ou observando um grafico sem enviar frames), proxies L7 frequentemente
+   aplicam timeouts de inatividade (por volta de 60 segundos) e encerram
+   o tunel silenciosamente — provocando ciclos sincronizados de
+   reconexao em massa pelos clientes.
+
+d) Roteamento entre Multiplos Servidores e Gargalo de Fan-Out:
+   Com a escala horizontal para varios nos WebSocket, clientes de uma
+   mesma sala ficam espalhados por maquinas diferentes (Usuario A no
+   Servidor 1, Usuario B no Servidor 2). E indispensavel um barramento
+   entre servidores. Contudo, em cenarios de broadcast massivo (centenas
+   de eventos por segundo replicados para centenas de servidores e
+   milhoes de clientes), um broker Pub/Sub single-threaded como o Redis
+   pode tornar-se CPU-bound ao duplicar e empurrar pacotes para todos os
+   assinantes.
+
+e) Acoplamento de Regra de Negocio e Sobrecarga do Banco na Reconexao:
+   Se a logica de negocio (validacoes, calculo de estado, escrita em
+   banco) rodar no mesmo processo que segura os sockets WebSocket,
+   qualquer deploy para corrigir um bug reinicia o servidor e derruba
+   todas as conexoes abertas. Somado a isso, apos breves quedas de rede
+   (como dispositivos moveis perdendo sinal por alguns segundos), se
+   milhares de clientes reconectarem executando consultas pesadas no
+   banco principal ("buscar mensagens dos ultimos segundos"), o banco
+   relacional sofre sobrecarga severa e pode cair junto com a aplicacao.
+
+Justifica-se, portanto, o desenho de uma arquitetura distribuida que
+separe claramente a manutencao de conexoes do processamento de negocio,
+utilize balanceamento em Camada 4 e proteja o banco de dados contra
+tempestades de reconexao.
+
+
+3. METODOLOGIA (COMO O PROBLEMA E RESOLVIDO)
+------------------------------------------------------------------------
+Para enderecar os gargalos de grande volume descritos na Secao 2, a
+solucao aplica um conjunto articulado de padroes de System Design para
+sistemas distribuidos em tempo real:
+
+1. Segregacao de Protocolos conforme o Caso de Uso:
+   Adota-se WebSocket para a sala interativa principal (comunicacao
+   bidirecional e baixa latencia) e mantem-se um feed paralelo em Short
+   Polling HTTP para notificacoes de sistema, possibilitando demonstrar
+   empiricamente a diferenca de overhead e requisicoes improdutivas.
+
+2. Balanceamento de Carga na Camada 4 (L4 TCP) com Least Connections:
+   O HAProxy opera em modo TCP puro (mode tcp) na Camada de Transporte,
+   repassando bytes sem interpretar ou reempacotar HTTP apos o handshake.
+   O algoritmo Least Connections distribui novos clientes para o servidor
+   com menor carga de conexoes abertas no momento, evitando timeouts
+   agressivos de Camada 7.
+
+3. Gateway Pattern (Dumb Gateways + Smart Worker):
+   O sistema separa a camada de conexao da camada de aplicacao:
+   - Dumb Gateways: processos minimalistas que apenas mantem sockets
+     WebSocket abertos, gerenciam heartbeats e encaminham mensagens. Por
+     nao possuirem regras de negocio volateis, raramente sao reiniciados,
+     preservando as conexoes ativas dos clientes.
+   - Smart Worker: processo independente que consome mensagens de uma
+     fila, aplica a regra de negocio, ordena eventos e grava no banco de
+     dados (padrao Single-Writer). Atualizacoes e reinicios do Worker
+     ocorrem de forma transparente, sem desconectar nenhum cliente.
+
+4. Coordenacao Distribuida e Roteamento Cross-Server com Redis:
+   O Redis coordena o cluster por meio de quatro mecanismos em memoria:
+   - Distributed Session Manager: armazena o mapeamento dinamico
+     session:{userId} -> gatewayId com expiracao por TTL renovada via
+     heartbeat;
+   - Fila de Trabalho (jobs:messages): bufferiza comandos recebidos pelos
+     Gateways ate serem processados pelo Smart Worker;
+   - Pub/Sub Backplane (room:main): replica cada mensagem processada para
+     todos os Gateways conectados entregarem a seus clientes locais;
+   - Trace Stream (trace:events): canal de observabilidade que registra
+     os saltos reais percorridos por cada evento.
+
+5. Protecao contra Thundering Herd (Sequence ID + Ring Buffer):
+   O Smart Worker atribui a cada mensagem um Sequence ID (seqId)
+   estritamente crescente e armazena as ultimas 50 mensagens em um Ring
+   Buffer circular na memoria do Redis. Em desconexoes curtas, o cliente
+   envia seu lastSeenSeqId na reconexao e o Gateway executa o replay
+   diretamente do Ring Buffer em memoria (zero consultas ao banco
+   relacional). Somente desconexoes longas fora da janela em memoria
+   recorrem ao banco PostgreSQL.
+
+
+4. ARQUITETURA DA SOLUCAO
+------------------------------------------------------------------------
+A arquitetura foi estruturada com sete servicos independentes em Docker
+Compose, interligados em uma rede interna dedicada.
+
+[INSERIR IMAGEM AQUI: docs/system-design-architecture.jpg]
+Figura 1 - Arquitetura distribuida da solucao (servidores, tecnologias,
+portas e rotas de WebSocket, Short Polling e Reconexao).
+
+4.1 Descricao de Cada Componente do Diagrama
+
+a) Clientes Web / Celulares e Cloudflare Quick Tunnel (Opcional):
+   Navegadores e dispositivos moveis acessam a aplicacao web. Para
+   demonstracoes remotas ou em sala de aula com multiplos usuarios
+   reais, o Cloudflare Quick Tunnel fornece um tunel HTTPS/WSS publico
+   apontando para a porta 3000 sem configuracao de DNS ou firewall.
+
+b) Servidor Web & Proxy (web - Node.js 24, porta 3000):
+   Atua como ponto unico de entrada HTTP e WebSocket. Entrega os arquivos
+   estaticos da interface web, expoe /api/notifications (Short Polling),
+   /api/cluster (diagnostico de sessoes e buffer) e /ws-trace (stream de
+   telemetria para o mapa animado), alem de realizar o proxy TCP da rota
+   /ws para o HAProxy (:8080). Cada cliente que faz upgrade em /ws abre
+   uma conexao TCP distinta no HAProxy, preservando o balanceamento L4 e
+   garantindo compatibilidade com HTTPS/WSS de mesma origem.
+
+c) HAProxy Load Balancer L4 (haproxy - HAProxy 2.9, portas 8080 e 8404):
+   Balanceador de Camada 4 configurado com mode tcp, balance leastconn e
+   verificacao ativa de saude (tcp-check) para gateway-1 e gateway-2. A
+   porta 8404 expoe o painel nativo de estatisticas do HAProxy para
+   inspecao em tempo real da distribuicao de conexoes.
+
+d) Dumb Gateways (gateway-1 na porta 4001 e gateway-2 na porta 4002):
+   Duas instancias identicas em Node.js com a biblioteca ws. Aceitam
+   conexoes WebSocket, registram sessoes no Redis com TTL de 45 segundos
+   (renovado por ping/pong), assinam room:main no Redis Pub/Sub para
+   entrega aos sockets locais e executam o protocolo de sincronizacao
+   (lastSeenSeqId) priorizando o Ring Buffer antes do fallback no banco.
+
+e) Redis 7 (redis - porta 6379):
+   Atua como espinha dorsal em memoria do sistema distribuido:
+   - Session Manager: chaves session:{userId} indicando o Gateway dono
+     do socket;
+   - Sequence Generator: contador atomico seq:room:main via comando INCR;
+   - Ring Buffer: lista limitada ring:room:main (LPUSH/LTRIM com 50
+     mensagens recentes);
+   - Fila jobs:messages (RPUSH/BLPOP) e canais Pub/Sub (room:main e
+     trace:events).
+
+f) Smart Worker (worker-1 - Node.js 24):
+   Servico sem portas publicas que consome jobs:messages via BLPOP.
+   Centraliza validacao, geracao de seqId, atualizacao do Ring Buffer,
+   gravacao duravel no PostgreSQL (Single-Writer) e publicacao no canal
+   room:main. Por ser desacoplado dos sockets, pode ser escalado ou
+   reiniciado sem causar quedas nos clientes.
+
+g) PostgreSQL 16 (postgres - porta 5432):
+   Banco relacional responsavel pela persistencia duravel nas tabelas
+   messages (historico completo ordenado por seq_id) e notifications
+   (eventos consultados pelo endpoint de Short Polling). Atende tambem ao
+   fallback controlado de clientes que ficaram offline alem da janela
+   coberta pelo Ring Buffer.
+
+4.2 Descricao das Rotas do Sistema
+- Rota WebSocket (Ida e Volta): Cliente -> Web Proxy (:3000/ws) ->
+  HAProxy L4 (:8080) -> Gateway atribuido -> Redis (jobs:messages) ->
+  Smart Worker -> PostgreSQL + Redis (seqId/Ring Buffer) -> Redis Pub/Sub
+  (room:main) -> Gateway 1 e Gateway 2 -> Todos os Clientes conectados.
+- Rota Short Polling: Cliente -> Web (:3000/api/notifications) ->
+  PostgreSQL (SELECT) -> Cliente.
+- Rota de Reconexao: Cliente (enviando lastSeenSeqId) -> Web Proxy ->
+  HAProxy L4 -> Gateway -> Ring Buffer do Redis (recuperacao rapida em
+  RAM) ou Fallback PostgreSQL (offline longo) -> Cliente.
+
+4.3 Limites em Escala Extrema e Evolucao Arquitetural
+Para cenarios produtivos na escala de milhoes de usuarios simultaneos e
+altissima taxa de broadcast global (fan-out), a analise baseada na
+literatura tecnica destaca duas evolucoes naturais desta arquitetura:
+- Substituicao do Redis Pub/Sub por streaming distribuido particionado
+  (como Apache Kafka ou NATS) quando o volume de replicacao de mensagens
+  saturar a thread unica do Redis;
+- Ajuste de parametros de sistema operacional nos nos de Gateway
+  (fs.file-max, limites ulimit e dimensionamento de RAM para ~50 a 100 KB
+  por socket com TLS), aliado a escalonamento horizontal de dezenas de
+  Dumb Gateways atras de balanceadores L4 dedicados.
+
+
+5. PROTOTIPO DA SOLUCAO (DESCRICAO DO QUE FOI FEITO)
+------------------------------------------------------------------------
+[NOTA DE REVISAO: Secao a ser finalizada com as evidencias e metricas
+reais apos a implementacao e execucao dos containers Docker.]
+
+O prototipo pratico contempla a implementacao completa dos sete nos
+descritos na Secao 4 por meio de Docker Compose (docker-compose.yml,
+haproxy/haproxy.cfg, db/init.sql e servicos Node.js em src/):
+
+- Sala WebSocket unica multi-usuario: varios usuarios acessam a
+  aplicacao simultaneamente (multiplas abas locais ou dispositivos via
+  Cloudflare Quick Tunnel), sendo distribuidos entre gateway-1 e
+  gateway-2 pelo HAProxy L4 e trocando mensagens ordenadas por seqId.
+- Painel de Notificacoes via Short Polling: executa requisicoes HTTP
+  periodicas em /api/notifications, exibindo em tempo real o total de
+  requisicoes efetuadas contra o numero de requisicoes vazias
+  ("fantasmas"), comprovando na pratica a diferenca de eficiencia em
+  relacao ao WebSocket.
+- Mapa Visual Animado das Rotas (SVG Interativo): conectado ao stream
+  /ws-trace, exibe graficamente o trajeto real de ida e volta das
+  mensagens entre servidores, com suporte ao modo "Replay em Camera
+  Lenta" para inspecao passo a passo durante a apresentacao.
+- Validacao de Tolerancia a Falhas: simulacao de queda e reconexao no
+  navegador comprovando o replay pelo Ring Buffer sem consultas ao
+  PostgreSQL, reinicio do container worker-1 sem derrubar conexoes
+  WebSocket ativas e script automatizado (scripts/load-test.mjs) para
+  verificacao de carga e entrega cross-gateway.
+
+[ESPACO RESERVADO PARA EVIDENCIAS POS-EXECUCAO:
+ - Saida do comando docker compose ps;
+ - Resultado da execucao dos testes automatizados (npm test);
+ - Capturas de tela do chat, mapa animado das rotas e HAProxy Stats.]
+
+
+6. CONCLUSAO
+------------------------------------------------------------------------
+O estudo e o prototipo desenvolvidos evidenciam que a escalabilidade de
+WebSockets em grande volume impoe desafios proprios de Sistemas
+Distribuidos que vao muito alem da implementacao do protocolo. O
+carater stateful das conexoes exige atencao direta a limites de memoria
+e descritores de arquivo, balanceamento em Camada 4 para evitar quedas
+por timeout L7, separacao de responsabilidades atraves do Gateway Pattern
+para eliminar pontos unicos de falha em deploys e uso combinado de
+Redis (Session Manager, Pub/Sub e Ring Buffer) com persistencia em
+PostgreSQL para impedir tempestades de reconexao (thundering herd).
+
+A validacao pratica por meio da arquitetura conteinerizada, da comparacao
+direta com Short Polling e da visualizacao em tempo real do fluxo entre
+servidores consolida de forma objetiva os conceitos de comunicacao,
+escalabilidade horizontal e tolerancia a falhas da disciplina.
+========================================================================

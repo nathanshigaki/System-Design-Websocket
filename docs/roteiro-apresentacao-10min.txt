@@ -1,0 +1,156 @@
+========================================================================
+ROTEIRO DE APRESENTACAO - SISTEMAS DISTRIBUIDOS (MAXIMO: 10 MINUTOS)
+Divisao para 4 Pessoas | Estilo didatico baseado nos 2 videos
+========================================================================
+
+PREPARACAO ANTES DE COMECAR (NAO CONTA NOS 10 MIN):
+- Containers no ar: docker compose up -d
+- Abas abertas:
+  1) http://localhost:3000 (ou link do Cloudflare Tunnel para a turma)
+  2) http://localhost:8404 (HAProxy Stats)
+  3) Imagem docs/system-design-architecture.jpg na tela/slide
+- Terminal pronto com o comando: docker compose restart worker-1
+
+------------------------------------------------------------------------
+PESSOA 1 (0:00 a 2:00 | 2m00s)
+Tema: Delimitacao do Problema e Por que WebSocket (Polling vs SSE vs WS)
+------------------------------------------------------------------------
+"Ola pessoal! Nosso trabalho resolve um problema bem pratico de Sistemas
+Distribuidos: como entregar atualizacoes em tempo real para varios
+usuarios sem derrubar o servidor e o banco de dados quando o sistema
+cresce.
+
+Imaginem aplicativos como WhatsApp, Uber ou iFood. Se usarmos o HTTP
+comum com 'Short Polling' — onde o navegador pergunta para o servidor a
+cada 5 segundos 'tem novidade?' — com 100 usuarios funciona. Mas e com
+milhoes de usuarios? A maioria das respostas volta vazia. Sao as chamadas
+'requisicoes fantasmas': o servidor e o banco gastam CPU e rede a toa, e
+a entrega ainda tem atraso (tipo o carrinho do Uber pulando de 10 em 10
+segundos).
+
+Alguem poderia perguntar: e o SSE (Server-Sent Events)? O SSE e otimo
+quando os dados so vao do servidor para o cliente — como um painel de
+cotacoes ou bolsa de valores. Mas em um chat ou sistema interativo, o
+cliente tambem precisa enviar mensagens o tempo todo.
+
+Ai entra o WebSocket: ele comeca como um HTTP normal com um pedido de
+'Upgrade', e vira um tunel TCP aberto nos dois sentidos (bidirecional),
+com latencia quase instantanea. O problema e que, diferente de uma API
+REST comum, o WebSocket e 'stateful' — ele segura uma conexao aberta na
+memoria do servidor. E e exatamente quando precisamos escalar isso para
+grande volume que os problemas de Sistemas Distribuidos comecam."
+
+------------------------------------------------------------------------
+PESSOA 2 (2:00 a 4:15 | 2m15s)
+Tema: Problemas de Grande Volume e Load Balancer L4 vs L7
+------------------------------------------------------------------------
+"Pois e, muita gente acha que e so subir um servidor WebSocket e pronto.
+Mas quando o volume cresce, um servidor sozinho nao aguenta por causa de
+tres limites bem fisicos:
+
+1. Limite de arquivos abertos (File Descriptors): no Linux, cada conexao
+   WebSocket aberta conta como um arquivo aberto. Por padrao o sistema
+   trava em poucos milhares (~65 mil) se voce nao ajustar o kernel.
+2. Consumo de memoria RAM: mesmo uma conexao parada consome cerca de
+   50 KB de buffer TCP no sistema operacional. Em 1 milhao de conexoes,
+   ja sao 50 GB de RAM so para manter gente conectada — e com criptografia
+   TLS (WSS), isso dobra para cerca de 100 GB! Nos benchmarks mostrados
+   nos estudos, uma maquina forte (16 cores, 32 GB RAM) aguenta na faixa
+   de 300 a 500 mil conexoes simultaneas.
+3. Raio de explosao (Blast Radius): se voce coloca 500 mil pessoas em um
+   unico servidor e ele cai, meio milhao de usuarios tentam reconectar no
+   mesmo segundo — derrubando o sistema inteiro.
+
+Por isso precisamos de varios servidores WebSocket em paralelo e de um
+Load Balancer na frente. E aqui mora um erro classico: usar um Load
+Balancer de Camada 7 (HTTP), como um proxy padrao. Como o L7 espera
+requisicoes HTTP novas, se o usuario ficar uns 60 segundos so lendo o
+chat sem mandar nada, o L7 acha que a conexao morreu por idle timeout e
+derruba o WebSocket!
+
+A solucao que usamos no projeto e o Load Balancer de Camada 4 (L4), com
+HAProxy em modo TCP puro e algoritmo Least Connections. Ele nao fica
+abrindo pacotes HTTP: ele so repassa o tunel TCP direto para o Gateway
+que tiver menos conexoes abertas no momento."
+
+------------------------------------------------------------------------
+PESSOA 3 (4:15 a 6:30 | 2m15s)
+Tema: Gateway Pattern, Redis (Session + Pub/Sub) e Reconexao sem Travar o DB
+------------------------------------------------------------------------
+[Apontando para a imagem docs/system-design-architecture.jpg]
+
+"Agora que temos o Gateway 1 e o Gateway 2 rodando em paralelo, surgem
+outros tres problemas que resolvemos nesta arquitetura:
+
+Primeiro: e se o usuario mandar uma mensagem e a gente precisar atualizar
+ou reiniciar o codigo da aplicacao? Se a regra de negocio estiver junta
+com o WebSocket, reiniciar o servidor derruba todo mundo. Por isso
+usamos o 'Gateway Pattern':
+- Os Gateways 1 e 2 sao 'Dumb Gateways' (gateways burros): eles nao tem
+  regra de negocio, so seguram os sockets abertos.
+- A regra de negocio fica isolada no 'Smart Worker'. Se reiniciarmos o
+  Worker, nenhuma conexao WebSocket dos usuarios cai!
+
+Segundo: como a Alice no Gateway 1 conversa com o Bob no Gateway 2?
+Usamos o Redis como ponte entre servidores:
+- Ele guarda o 'Session Manager' (quem esta em qual Gateway);
+- Recebe os comandos numa fila para o Worker processar;
+- E usa o Redis Pub/Sub (topico room:main) para avisar todos os Gateways
+  ao mesmo tempo.
+(Vale citar um detalhe importante de grande volume: o Redis e
+single-threaded. Para escalas gigantescas de milhoes de broadcasts por
+segundo, o Pub/Sub do Redis vira gargalo de CPU e e trocado por Kafka
+ou NATS — no nosso prototipo de sala, o Redis atende com folga.)
+
+Terceiro: e se o usuario passar num tunel sem sinal por 3 segundos e
+reconectar? Se 100 mil pessoas reconectarem pedindo 'me da as mensagens
+dos ultimos 5 segundos' direto no PostgreSQL, o banco cai (efeito
+Thundering Herd). Para evitar isso, o Worker da um 'seqId' crescente para
+cada mensagem e guarda as ultimas 50 num Ring Buffer na memoria do Redis.
+Na reconexao rapida, o Gateway pega tudo do Ring Buffer sem nem tocar no
+PostgreSQL — deixando o banco so para quem ficou offline por muito tempo."
+
+------------------------------------------------------------------------
+PESSOA 4 (6:30 a 9:30 | 3m00s + 30s de folga para fechar em 10:00)
+Tema: Demonstracao do Prototipo Funcional ao Vivo e Conclusao
+------------------------------------------------------------------------
+[Compartilhando a tela com o navegador e um terminal]
+
+"Agora vamos mostrar tudo isso funcionando de verdade em containers Docker:
+
+1. Conexao e Balanceamento L4 (0:40):
+   - Aqui temos nossa sala WebSocket unica em http://localhost:3000
+     [ou pelo link do Cloudflare Tunnel com alguns colegas entrando].
+   - Conectando Alice, Bob e Carol em abas diferentes, vemos aqui no
+     painel do Cluster e no HAProxy Stats (:8404) que o Least Connections
+     dividiu automaticamente os usuarios entre gateway-1 e gateway-2.
+
+2. Mensagem Cross-Gateway + Mapa Animado das Rotas (0:50):
+   - Vou mandar uma mensagem pela Alice (no gateway-1) e ela aparece na
+     hora para o Bob (no gateway-2), com o mesmo #seqId.
+   - E olhem aqui no Mapa Animado da Arquitetura — vou clicar em 'Replay
+     em Camera Lenta': conseguimos ver o caminho real que essa mensagem
+     fez: Cliente -> Proxy Web (:3000) -> HAProxy L4 (:8080) -> Gateway 1
+     -> Redis Fila -> Smart Worker -> PostgreSQL + Ring Buffer -> Redis
+     Pub/Sub -> voltando pelos dois Gateways ate todos os clientes!
+
+3. Comparativo com Short Polling (0:35):
+   - Aqui do lado temos um feed de notificacoes rodando com Short Polling
+     (/api/notifications). Percebam o contador: mesmo sem ninguem falar
+     nada, ele continua fazendo requisicoes HTTP vazias ('requisicoes
+     fantasmas'), provando na pratica o que falamos no comeco.
+
+4. Tolerancia a Falhas ao Vivo (0:45):
+   - Primeiro, clico em 'Simular Queda' no Bob, mando uma mensagem pela
+     Alice e reconecto o Bob: ele recupera a mensagem automaticamente
+     indicando que veio do Ring Buffer do Redis (zero consulta no banco!).
+   - Por ultimo, vou aqui no terminal e reinicio o Smart Worker:
+       docker compose restart worker-1
+     Vejam que nenhum usuario desconectou da sala! Os Gateways seguraram
+     os WebSockets normalmente enquanto o Worker reiniciava.
+
+Conclusao (0:10):
+Com isso provamos na pratica que escalar WebSockets exige balanceamento L4,
+Gateway Pattern, backplane Pub/Sub e Ring Buffer para proteger o banco.
+Muito obrigado, ficamos abertos a perguntas!"
+========================================================================
