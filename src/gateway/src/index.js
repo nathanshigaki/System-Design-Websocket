@@ -266,6 +266,33 @@ wss.on('connection', async (ws, req) => {
       await emitHop({
         traceId,
         flow: 'websocket',
+        step: 1,
+        from: 'client',
+        to: 'web',
+        protocol: 'WSS /ws',
+        detail: `${userId} enviou mensagem`,
+      });
+      await emitHop({
+        traceId,
+        flow: 'websocket',
+        step: 2,
+        from: 'web',
+        to: 'haproxy',
+        protocol: 'TCP L4',
+        detail: 'Proxy /ws -> HAProxy',
+      });
+      await emitHop({
+        traceId,
+        flow: 'websocket',
+        step: 2,
+        from: 'haproxy',
+        to: GATEWAY_ID,
+        protocol: 'TCP Passthrough',
+        detail: `Tunel ativo em ${GATEWAY_ID}`,
+      });
+      await emitHop({
+        traceId,
+        flow: 'websocket',
         step: 3,
         from: GATEWAY_ID,
         to: 'redis',
