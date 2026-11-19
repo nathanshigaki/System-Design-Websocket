@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PulseWS — Sala WebSocket Escalável (Sistemas Distribuídos)</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <span class="brand-dot"></span>
+      <div>
+        <h1>PulseWS — Arquitetura Distribuída WebSocket</h1>
+        <p>HAProxy L4 • Dumb Gateways • Redis (Session / PubSub / Ring Buffer) • Smart Worker • PostgreSQL</p>
+      </div>
+    </div>
+    <div class="topbar-badges">
+      <span id="trace-status" class="pill pill-muted">Trace: conectando...</span>
+      <a id="haproxy-link" class="pill pill-link" href="http://localhost:8404" target="_blank" rel="noopener">
+        HAProxy Stats :8404
+      </a>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- PAINEL 1: MAPA ANIMADO DA ARQUITETURA -->
+    <section class="card architecture-card">
+      <div class="card-header">
+        <div>
+          <h2>Mapa Vivo da Arquitetura &amp; Rotas das Mensagens</h2>
+          <p class="subtitle">Telemetria em tempo real via Redis Pub/Sub (<code>/ws-trace</code>) mostrando ida e volta em cada servidor</p>
+        </div>
+        <div class="arch-controls">
+          <label class="toggle-label">
+            <input type="checkbox" id="toggle-polling-anim" checked />
+            Mostrar Polling no mapa
+          </label>
+          <button id="btn-replay" class="btn btn-secondary" disabled>
+            Replay Última Rota (Câmera Lenta)
+          </button>
+        </div>
+      </div>
+
+      <div class="legend-row">
+        <span class="legend-item"><i class="dot dot-ws"></i> WebSocket (Ida e Volta)</span>
+        <span class="legend-item"><i class="dot dot-poll"></i> Short Polling (/api/notifications)</span>
+        <span class="legend-item"><i class="dot dot-rec"></i> Reconexão (Ring Buffer / PostgreSQL)</span>
+      </div>
+
+      <div class="svg-wrapper">
+        <svg id="arch-svg" viewBox="0 0 1120 390" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arrow-ws" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8" />
+            </marker>
+            <marker id="arrow-poll" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b" />
+            </marker>
+            <marker id="arrow-rec" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#22c55e" />
+            </marker>
+          </defs>
+
+          <!-- ROTAS SVG (Paths para animação com getPointAtLength) -->
+          <!-- WebSocket / Borda -->
+          <path id="path-client-web" class="route-line route-ws" d="M 165 185 L 235 185" marker-end="url(#arrow-ws)" />
+          <path id="path-web-haproxy" class="route-line route-ws" d="M 310 140 L 310 220" marker-end="url(#arrow-ws)" />
+          <path id="path-haproxy-gw1" class="route-line route-ws" d="M 385 255 C 425 255, 420 115, 460 115" marker-end="url(#arrow-ws)" />
+          <path id="path-haproxy-gw2" class="route-line route-ws" d="M 385 280 L 460 280" marker-end="url(#arrow-ws)" />
+
+          <!-- Gateways <-> Clientes (retorno direto visual pelo edge/túnel) -->
+          <path id="path-gw1-client" class="route-line route-ws-return" d="M 460 90 C 310 45, 160 65, 95 140" marker-end="url(#arrow-ws)" />
+          <path id="path-gw2-client" class="route-line route-ws-return" d="M 460 305 C 310 355, 160 330, 95 230" marker-end="url(#arrow-ws)" />
+
+          <!-- Gateways <-> Redis -->
+          <path id="path-gw1-redis" class="route-line route-ws" d="M 620 115 C 655 115, 655 170, 690 170" marker-end="url(#arrow-ws)" />
+          <path id="path-gw2-redis" class="route-line route-ws" d="M 620 275 C 655 275, 655 215, 690 215" marker-end="url(#arrow-ws)" />
+
+          <!-- Redis <-> Smart Worker -->
+          <path id="path-redis-worker" class="route-line route-ws" d="M 865 145 L 935 110" marker-end="url(#arrow-ws)" />
+          <path id="path-worker-redis" class="route-line route-ws" d="M 935 135 L 865 175" marker-end="url(#arrow-ws)" />
+
+          <!-- Smart Worker -> PostgreSQL -->
+          <path id="path-worker-postgres" class="route-line route-ws" d="M 1015 160 L 1015 225" marker-end="url(#arrow-ws)" />
+
+          <!-- Short Polling: Web -> PostgreSQL (por cima evitando Worker) -->
+          <path id="path-web-postgres" class="route-line route-poll" d="M 310 60 C 480 12, 870 12, 1015 225" marker-end="url(#arrow-poll)" />
+
+          <!-- Fallback PostgreSQL -> Gateways (Reconexão longa) -->
+          <path id="path-postgres-gw1" class="route-line route-rec" d="M 935 280 C 830 355, 675 355, 540 160" marker-end="url(#arrow-rec)" />
+          <path id="path-postgres-gw2" class="route-line route-rec" d="M 935 295 C 820 360, 690 355, 620 295" marker-end="url(#arrow-rec)" />
+
+          <!-- NÓS DA ARQUITETURA -->
+          <!-- Clientes -->
+          <g id="node-client" class="arch-node">
+            <rect x="20" y="140" width="145" height="90" rx="12" />
+            <text x="92" y="170" class="node-title">Clientes Web</text>
+            <text x="92" y="190" class="node-tech">Browser / Celular</text>
+            <text x="92" y="210" class="node-port">WSS / HTTP Polling</text>
+          </g>
+
+          <!-- Web Edge Proxy -->
+          <g id="node-web" class="arch-node">
+            <rect x="235" y="60" width="150" height="80" rx="12" />
+            <text x="310" y="88" class="node-title">Web Edge &amp; Proxy</text>
+            <text x="310" y="106" class="node-tech">Node.js 24 (:3000)</text>
+            <text x="310" y="124" class="node-port">/ws | /api/notifications</text>
+          </g>
+
+          <!-- HAProxy L4 -->
+          <g id="node-haproxy" class="arch-node">
+            <rect x="235" y="220" width="150" height="85" rx="12" />
+            <text x="310" y="248" class="node-title">HAProxy L4</text>
+            <text x="310" y="266" class="node-tech">mode tcp | leastconn</text>
+            <text x="310" y="285" class="node-port">:8080 (Stats :8404)</text>
+          </g>
+
+          <!-- Gateway 1 -->
+          <g id="node-gateway-1" class="arch-node">
+            <rect x="460" y="75" width="160" height="85" rx="12" />
+            <text x="540" y="102" class="node-title">Dumb Gateway 1</text>
+            <text x="540" y="120" class="node-tech">Node.js + ws (:4001)</text>
+            <text id="svg-gw1-count" x="540" y="142" class="node-badge">0 conexões</text>
+          </g>
+
+          <!-- Gateway 2 -->
+          <g id="node-gateway-2" class="arch-node">
+            <rect x="460" y="235" width="160" height="85" rx="12" />
+            <text x="540" y="262" class="node-title">Dumb Gateway 2</text>
+            <text x="540" y="280" class="node-tech">Node.js + ws (:4002)</text>
+            <text id="svg-gw2-count" x="540" y="302" class="node-badge">0 conexões</text>
+          </g>
+
+          <!-- Redis -->
+          <g id="node-redis" class="arch-node arch-node-redis">
+            <rect x="690" y="105" width="175" height="175" rx="14" />
+            <text x="777" y="132" class="node-title">Redis 7 (:6379)</text>
+            <text x="777" y="156" class="node-tech">• Session Manager</text>
+            <text x="777" y="178" class="node-tech">• Pub/Sub (room:main)</text>
+            <text id="svg-ring-count" x="777" y="200" class="node-tech">• Ring Buffer (0/50)</text>
+            <text x="777" y="222" class="node-tech">• Fila (jobs:messages)</text>
+            <text id="svg-seq-count" x="777" y="256" class="node-badge">#seqId atual: 0</text>
+          </g>
+
+          <!-- Smart Worker -->
+          <g id="node-worker" class="arch-node arch-node-worker">
+            <rect x="935" y="75" width="165" height="85" rx="12" />
+            <text x="1017" y="102" class="node-title">Smart Worker</text>
+            <text x="1017" y="120" class="node-tech">Node.js 24 | Single-Writer</text>
+            <text x="1017" y="140" class="node-port">Regra + seqId + DB</text>
+          </g>
+
+          <!-- PostgreSQL -->
+          <g id="node-postgres" class="arch-node arch-node-pg">
+            <rect x="935" y="225" width="165" height="90" rx="12" />
+            <text x="1017" y="254" class="node-title">PostgreSQL 16</text>
+            <text x="1017" y="274" class="node-tech">messages &amp; notifications</text>
+            <text x="1017" y="294" class="node-port">:5432 (Offline / Polling)</text>
+          </g>
+
+          <!-- Camada de pacotes animados -->
+          <g id="packets-layer"></g>
+        </svg>
+      </div>
+
+      <div class="trace-footer">
+        <div id="trace-step-banner" class="trace-banner">
+          Aguardando atividade... Conecte um usuário e envie uma mensagem para ver a rota completa.
+        </div>
+        <div id="trace-log" class="trace-log"></div>
+      </div>
+    </section>
+
+    <!-- GRID PRINCIPAL: SALA WEBSOCKET + POLLING/CLUSTER -->
+    <div class="main-grid">
+      <!-- COLUNA ESQUERDA: SALA WEBSOCKET -->
+      <section class="card chat-card">
+        <div class="card-header">
+          <div>
+            <h2>Sala WebSocket (<code>room:main</code>)</h2>
+            <p class="subtitle">Comunicação bidirecional em tempo real via <code>/ws</code> -> HAProxy L4</p>
+          </div>
+          <button id="btn-new-tab" class="btn btn-ghost" type="button">Abrir Nova Aba</button>
+        </div>
+
+        <form id="connect-form" class="connect-bar">
+          <input
+            id="username-input"
+            type="text"
+            maxlength="32"
+            placeholder="Seu nome (ex: Alice)"
+            required
+          />
+          <button id="btn-connect" class="btn btn-primary" type="submit">Conectar</button>
+          <button id="btn-simulate-drop" class="btn btn-warning" type="button" disabled>
+            Simular Queda
+          </button>
+        </form>
+
+        <div class="status-strip">
+          <span id="ws-conn-badge" class="pill pill-muted">Desconectado</span>
+          <span id="ws-gw-badge" class="pill pill-muted">Gateway: —</span>
+          <span id="ws-seq-badge" class="pill pill-muted">#seqId: 0</span>
+          <span id="ws-recovery-badge" class="pill pill-hidden"></span>
+        </div>
+
+        <div id="chat-messages" class="chat-messages">
+          <div class="empty-state">Conecte com seu nome acima para entrar na sala.</div>
+        </div>
+
+        <form id="chat-form" class="chat-input-bar">
+          <input
+            id="message-input"
+            type="text"
+            maxlength="500"
+            placeholder="Digite uma mensagem para a sala..."
+            disabled
+          />
+          <button id="btn-send" class="btn btn-primary" type="submit" disabled>Enviar</button>
+        </form>
+      </section>
+
+      <!-- COLUNA DIREITA: SHORT POLLING + CLUSTER -->
+      <div class="right-stack">
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2>Notificações (Short Polling)</h2>
+              <p class="subtitle"><code>GET /api/notifications</code> a cada 3s — comparativo de requisições</p>
+            </div>
+            <button id="btn-toggle-polling" class="btn btn-secondary" type="button">
+              Pausar Polling
+            </button>
+          </div>
+
+          <div class="kpi-grid">
+            <div class="kpi-box">
+              <span class="kpi-label">Req. Totais</span>
+              <strong id="poll-total" class="kpi-value">0</strong>
+            </div>
+            <div class="kpi-box">
+              <span class="kpi-label">Com Novidade</span>
+              <strong id="poll-hits" class="kpi-value kpi-ok">0</strong>
+            </div>
+            <div class="kpi-box">
+              <span class="kpi-label">Vazias ("Fantasmas")</span>
+              <strong id="poll-empty" class="kpi-value kpi-warn">0</strong>
+            </div>
+          </div>
+
+          <div id="poll-list" class="poll-list">
+            <div class="empty-state">Aguardando ciclo de polling...</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-header">
+            <div>
+              <h2>Cluster &amp; Session Manager (Redis)</h2>
+              <p class="subtitle">Distribuição L4 <code>leastconn</code> e sessões ativas</p>
+            </div>
+          </div>
+
+          <div class="kpi-grid">
+            <div class="kpi-box">
+              <span class="kpi-label">Gateway 1</span>
+              <strong id="cluster-gw1" class="kpi-value">0</strong>
+            </div>
+            <div class="kpi-box">
+              <span class="kpi-label">Gateway 2</span>
+              <strong id="cluster-gw2" class="kpi-value">0</strong>
+            </div>
+            <div class="kpi-box">
+              <span class="kpi-label">Ring Buffer</span>
+              <strong id="cluster-ring" class="kpi-value">0 / 50</strong>
+            </div>
+          </div>
+
+          <div id="session-list" class="session-list">
+            <div class="empty-state">Nenhuma sessão ativa no momento.</div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
