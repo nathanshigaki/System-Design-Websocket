@@ -18,11 +18,12 @@
 
   <main class="wrap page-main">
     <!-- SEÇÃO SUPERIOR (PRINCIPAL): CHAT + PAINEL LATERAL COMPACTO -->
-    <section class="workspace-grid" aria-label="Sala WebSocket e Monitoramento">
+    <section class="workspace-grid enter-block" aria-label="Sala WebSocket e Monitoramento">
       <!-- CHAT PRINCIPAL -->
       <div class="panel chat-panel">
         <div class="panel-head">
           <div class="chat-title-row">
+            <span id="live-ring" class="live-ring" aria-hidden="true"></span>
             <h2>Sala <code>room:main</code></h2>
             <span id="conn-meta" class="meta-inline">Desconectado</span>
           </div>
@@ -64,9 +65,12 @@
 
       <!-- COLUNA LATERAL COMPACTA: SHORT POLLING + CLUSTER -->
       <aside class="side-rail">
-        <div class="panel">
+        <div class="panel panel-polling">
           <div class="panel-head compact-head">
-            <h2>Short Polling</h2>
+            <div class="title-with-dot">
+              <span class="dot-tag dot-amber"></span>
+              <h2>Short Polling</h2>
+            </div>
             <button id="btn-toggle-polling" class="btn btn-secondary btn-sm" type="button">
               Pausar
             </button>
@@ -92,19 +96,22 @@
           </div>
         </div>
 
-        <div class="panel">
+        <div class="panel panel-cluster">
           <div class="panel-head compact-head">
-            <h2>Sessões no Cluster</h2>
+            <div class="title-with-dot">
+              <span class="dot-tag dot-blue"></span>
+              <h2>Sessões no Cluster</h2>
+            </div>
           </div>
 
           <div class="metrics-strip">
             <div class="metric-cell">
               <span class="metric-label">Gateway 1</span>
-              <strong id="cluster-gw1" class="metric-val">0</strong>
+              <strong id="cluster-gw1" class="metric-val val-sky">0</strong>
             </div>
             <div class="metric-cell">
               <span class="metric-label">Gateway 2</span>
-              <strong id="cluster-gw2" class="metric-val">0</strong>
+              <strong id="cluster-gw2" class="metric-val val-teal">0</strong>
             </div>
             <div class="metric-cell">
               <span class="metric-label">Ring Buffer</span>
@@ -120,7 +127,7 @@
     </section>
 
     <!-- SEÇÃO INFERIOR: MAPA AO VIVO DA ARQUITETURA -->
-    <section class="panel map-panel" aria-label="Rotas da Arquitetura">
+    <section class="panel map-panel enter-block enter-delay" aria-label="Rotas da Arquitetura">
       <div class="panel-head">
         <div class="map-head-left">
           <h2>Rotas da Arquitetura (Ao Vivo)</h2>
@@ -145,8 +152,18 @@
       <div class="svg-frame">
         <svg id="arch-svg" viewBox="0 0 1120 365" xmlns="http://www.w3.org/2000/svg">
           <defs>
+            <pattern id="dot-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+              <circle cx="1.5" cy="1.5" r="1" fill="rgba(148, 163, 184, 0.14)" />
+            </pattern>
+            <filter id="packet-glow" x="-60%" y="-60%" width="220%" height="220%">
+              <feGaussianBlur stdDeviation="2.8" result="blur" />
+              <feMerge>
+                <feMergeNode in="blur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
             <marker id="arrow-ws" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-              <path d="M 0 1 L 10 5 L 0 9 z" fill="#3b82f6" />
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8" />
             </marker>
             <marker id="arrow-poll" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
               <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b" />
@@ -155,6 +172,8 @@
               <path d="M 0 1 L 10 5 L 0 9 z" fill="#22c55e" />
             </marker>
           </defs>
+
+          <rect x="0" y="0" width="1120" height="365" fill="url(#dot-grid)" />
 
           <!-- ROTAS SVG -->
           <path id="path-client-web" class="route-line route-ws" d="M 165 175 L 235 175" marker-end="url(#arrow-ws)" />
@@ -178,43 +197,49 @@
           <path id="path-postgres-gw2" class="route-line route-rec" d="M 935 285 C 820 345, 690 340, 620 285" marker-end="url(#arrow-rec)" />
 
           <!-- NÓS DA ARQUITETURA -->
-          <g id="node-client" class="arch-node">
-            <rect x="20" y="130" width="145" height="90" rx="6" />
+          <g id="node-client" class="arch-node node-client">
+            <rect class="node-box" x="20" y="130" width="145" height="90" rx="6" />
+            <rect class="node-strip" x="20" y="130" width="145" height="3" rx="1.5" fill="#94a3b8" />
             <text x="92" y="160" class="node-title">Clientes</text>
             <text x="92" y="180" class="node-tech">Browser / Celular</text>
             <text x="92" y="200" class="node-port">WSS / HTTP</text>
           </g>
 
-          <g id="node-web" class="arch-node">
-            <rect x="235" y="50" width="150" height="80" rx="6" />
+          <g id="node-web" class="arch-node node-web">
+            <rect class="node-box" x="235" y="50" width="150" height="80" rx="6" />
+            <rect class="node-strip" x="235" y="50" width="150" height="3" rx="1.5" fill="#22c55e" />
             <text x="310" y="78" class="node-title">Web &amp; Proxy</text>
             <text x="310" y="96" class="node-tech">Node.js 24 (:3000)</text>
             <text x="310" y="114" class="node-port">/ws • /api/notifications</text>
           </g>
 
-          <g id="node-haproxy" class="arch-node">
-            <rect x="235" y="210" width="150" height="85" rx="6" />
+          <g id="node-haproxy" class="arch-node node-haproxy">
+            <rect class="node-box" x="235" y="210" width="150" height="85" rx="6" />
+            <rect class="node-strip" x="235" y="210" width="150" height="3" rx="1.5" fill="#06b6d4" />
             <text x="310" y="238" class="node-title">HAProxy L4</text>
             <text x="310" y="256" class="node-tech">mode tcp • leastconn</text>
             <text x="310" y="275" class="node-port">:8080 (Stats :8404)</text>
           </g>
 
-          <g id="node-gateway-1" class="arch-node">
-            <rect x="460" y="65" width="160" height="85" rx="6" />
+          <g id="node-gateway-1" class="arch-node node-gw1">
+            <rect class="node-box" x="460" y="65" width="160" height="85" rx="6" />
+            <rect class="node-strip" x="460" y="65" width="160" height="3" rx="1.5" fill="#38bdf8" />
             <text x="540" y="92" class="node-title">Gateway 1</text>
             <text x="540" y="110" class="node-tech">Node.js + ws (:4001)</text>
-            <text id="svg-gw1-count" x="540" y="132" class="node-badge">0 conexões</text>
+            <text id="svg-gw1-count" x="540" y="132" class="node-badge badge-sky">0 conexões</text>
           </g>
 
-          <g id="node-gateway-2" class="arch-node">
-            <rect x="460" y="225" width="160" height="85" rx="6" />
+          <g id="node-gateway-2" class="arch-node node-gw2">
+            <rect class="node-box" x="460" y="225" width="160" height="85" rx="6" />
+            <rect class="node-strip" x="460" y="225" width="160" height="3" rx="1.5" fill="#14b8a6" />
             <text x="540" y="252" class="node-title">Gateway 2</text>
             <text x="540" y="270" class="node-tech">Node.js + ws (:4002)</text>
-            <text id="svg-gw2-count" x="540" y="292" class="node-badge">0 conexões</text>
+            <text id="svg-gw2-count" x="540" y="292" class="node-badge badge-teal">0 conexões</text>
           </g>
 
-          <g id="node-redis" class="arch-node">
-            <rect x="690" y="95" width="175" height="175" rx="6" />
+          <g id="node-redis" class="arch-node node-redis">
+            <rect class="node-box" x="690" y="95" width="175" height="175" rx="6" />
+            <rect class="node-strip" x="690" y="95" width="175" height="3" rx="1.5" fill="#f43f5e" />
             <text x="777" y="122" class="node-title">Redis 7 (:6379)</text>
             <text x="777" y="146" class="node-tech">Session Manager</text>
             <text x="777" y="168" class="node-tech">Pub/Sub (room:main)</text>
@@ -223,15 +248,17 @@
             <text id="svg-seq-count" x="777" y="246" class="node-badge">#seqId: 0</text>
           </g>
 
-          <g id="node-worker" class="arch-node">
-            <rect x="935" y="65" width="165" height="85" rx="6" />
+          <g id="node-worker" class="arch-node node-worker">
+            <rect class="node-box" x="935" y="65" width="165" height="85" rx="6" />
+            <rect class="node-strip" x="935" y="65" width="165" height="3" rx="1.5" fill="#3b82f6" />
             <text x="1017" y="92" class="node-title">Smart Worker</text>
             <text x="1017" y="110" class="node-tech">Node.js 24 • Single-Writer</text>
             <text x="1017" y="130" class="node-port">Regra + seqId + DB</text>
           </g>
 
-          <g id="node-postgres" class="arch-node">
-            <rect x="935" y="215" width="165" height="90" rx="6" />
+          <g id="node-postgres" class="arch-node node-pg">
+            <rect class="node-box" x="935" y="215" width="165" height="90" rx="6" />
+            <rect class="node-strip" x="935" y="215" width="165" height="3" rx="1.5" fill="#f59e0b" />
             <text x="1017" y="244" class="node-title">PostgreSQL 16</text>
             <text x="1017" y="264" class="node-tech">messages &amp; notifications</text>
             <text x="1017" y="284" class="node-port">:5432 (Offline / Polling)</text>

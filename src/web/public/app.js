@@ -2,6 +2,20 @@ const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const WS_URL = `${wsProtocol}//${window.location.host}/ws`;
 const TRACE_WS_URL = `${wsProtocol}//${window.location.host}/ws-trace`;
 
+const STEP_STAGGER_MS = 260;
+const HOP_DURATION_MS = 320;
+const REPLAY_STAGGER_MS = 680;
+const REPLAY_DURATION_MS = 600;
+
+const AVATAR_PALETTE = [
+  '#38bdf8',
+  '#22c55e',
+  '#f59e0b',
+  '#14b8a6',
+  '#fb7185',
+  '#60a5fa',
+];
+
 const state = {
   ws: null,
   traceWs: null,
@@ -14,12 +28,15 @@ const state = {
   lastNotificationId: 0,
   pollStats: { total: 0, hits: 0, empty: 0 },
   tracesById: new Map(),
+  traceBuffers: new Map(),
+  traceFlushTimers: new Map(),
   lastWebSocketTraceId: null,
   replaying: false,
 };
 
 const el = {
   haproxyLink: document.getElementById('haproxy-link'),
+  liveRing: document.getElementById('live-ring'),
   connMeta: document.getElementById('conn-meta'),
   connectForm: document.getElementById('connect-form'),
   usernameInput: document.getElementById('username-input'),
@@ -77,12 +94,27 @@ const ROUTE_MAP = {
 };
 
 const FLOW_COLORS = {
-  websocket: '#3b82f6',
+  websocket: '#38bdf8',
   polling: '#f59e0b',
   reconnect: '#22c55e',
 };
 
-function flashNode(nodeId, flow) {
+function colorForUser(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i += 1) {
+    hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  }
+  return AVATAR_PALETTE[hash % AVATAR_PALETTE.length];
+}
+
+function tickMetric(elm, newText) {
+  if (elm.textContent === newText) return;
+  elm.textContent = newText;
+  elm.classList.add('tick');
+  setTimeout(() => elm.classList.remove('tick'), 180);
+}
+
+function flashNode(nodeId, flow, durationMs) {
   const node = document.getElementById(`node-${nodeId}`);
   if (!node) return;
   const cls =
@@ -92,13 +124,21 @@ function flashNode(nodeId, flow) {
         ? 'active-reconnect'
         : 'active';
   node.classList.add(cls);
-  setTimeout(() => node.classList.remove(cls), 520);
+  setTimeout(() => node.classList.remove(cls), Math.max(280, durationMs));
 }
 
-function animateHop(hop, durationMs = 400, updateText = false) {
+function createPacketDot(radius, fill, opacity) {
+  const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  circle.setAttribute('r', String(radius));
+  circle.setAttribute('fill', fill);
+  circle.setAttribute('opacity', String(opacity));
+  return circle;
+}
+
+function animateHop(hop, durationMs = HOP_DURATION_MS, updateText = false) {
   const route = ROUTE_MAP[`${hop.from}->${hop.to}`];
-  flashNode(hop.from, hop.flow);
-  flashNode(hop.to, hop.flow);
+  flashNode(hop.from, hop.flow, durationMs);
+  flashNode(hop.to, hop.flow, durationMs);
 
   if (updateText) {
     el.traceBanner.textContent = `${hop.from} -> ${hop.to} (${hop.protocol}): ${hop.detail}`;
@@ -109,30 +149,90 @@ function animateHop(hop, durationMs = 400, updateText = false) {
   if (!pathEl) return;
 
   pathEl.classList.add('active');
-  setTimeout(() => pathEl.classList.remove('active'), durationMs + 100);
+  setTimeout(() => pathEl.classList.remove('active'), durationMs + 80);
 
   const totalLength = pathEl.getTotalLength();
-  const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-  circle.setAttribute('r', '5.5');
-  circle.setAttribute('fill', FLOW_COLORS[hop.flow] || '#3b82f6');
-  circle.setAttribute('stroke', '#f8fafc');
-  circle.setAttribute('stroke-width', '1.4');
-  el.packetsLayer.appendChild(circle);
+  const color = FLOW_COLORS[hop.flow] || '#38bdf8';
+
+  const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const tail2 = createPacketDot(3.2, color, 0.35);
+  const tail1 = createPacketDot(4.4, color, 0.65);
+  const head = createPacketDot(6, color, 1);
+  head.setAttribute('stroke', '#f8fafc');
+  head.setAttribute('stroke-width', '1.4');
+  head.setAttribute('filter', 'url(#packet-glow)');
+
+  group.appendChild(tail2);
+  group.appendChild(tail1);
+  group.appendChild(head);
+  el.packetsLayer.appendChild(group);
 
   const start = performance.now();
   function frame(now) {
     const t = Math.min(1, (now - start) / durationMs);
-    const dist = route.reverse ? totalLength * (1 - t) : totalLength * t;
-    const pt = pathEl.getPointAtLength(dist);
-    circle.setAttribute('cx', String(pt.x));
-    circle.setAttribute('cy', String(pt.y));
+    const eased = t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;
+
+    const placeDot = (dot, offset) => {
+      const p = Math.max(0, Math.min(1, eased - offset));
+      const dist = route.reverse ? totalLength * (1 - p) : totalLength * p;
+      const pt = pathEl.getPointAtLength(dist);
+      dot.setAttribute('cx', String(pt.x));
+      dot.setAttribute('cy', String(pt.y));
+    };
+
+    placeDot(head, 0);
+    placeDot(tail1, 0.06);
+    placeDot(tail2, 0.12);
+
     if (t < 1) {
       requestAnimationFrame(frame);
     } else {
-      circle.remove();
+      group.remove();
     }
   }
   requestAnimationFrame(frame);
+}
+
+/**
+ * Plays a trace sequence grouped by `step` with real visual pacing,
+ * preventing simultaneous flashing when Redis/Worker complete in <5ms.
+ */
+async function playTraceSequence(hops, stepDelayMs, hopDurationMs, updateText) {
+  const byStep = new Map();
+  for (const hop of hops) {
+    const s = hop.step || 1;
+    if (!byStep.has(s)) byStep.set(s, []);
+    byStep.get(s).push(hop);
+  }
+
+  const orderedSteps = [...byStep.keys()].sort((a, b) => a - b);
+  for (let i = 0; i < orderedSteps.length; i += 1) {
+    const stepHops = byStep.get(orderedSteps[i]);
+    for (const hop of stepHops) {
+      animateHop(hop, hopDurationMs, updateText);
+    }
+    if (i < orderedSteps.length - 1) {
+      await new Promise((r) => setTimeout(r, stepDelayMs));
+    }
+  }
+}
+
+function scheduleTracePlayback(traceId, flow) {
+  if (state.traceFlushTimers.has(traceId)) {
+    clearTimeout(state.traceFlushTimers.get(traceId));
+  }
+
+  const timer = setTimeout(() => {
+    state.traceFlushTimers.delete(traceId);
+    const hops = state.traceBuffers.get(traceId);
+    state.traceBuffers.delete(traceId);
+    if (!hops || hops.length === 0 || state.replaying) return;
+
+    const isChatOrReconnect = flow === 'websocket' || flow === 'reconnect';
+    playTraceSequence(hops, STEP_STAGGER_MS, HOP_DURATION_MS, isChatOrReconnect);
+  }, 90);
+
+  state.traceFlushTimers.set(traceId, timer);
 }
 
 function recordTraceHop(hop) {
@@ -153,9 +253,12 @@ function recordTraceHop(hop) {
   if (hop.flow === 'polling' && !el.togglePollingAnim.checked) {
     return;
   }
-  if (!state.replaying) {
-    animateHop(hop, 380, isChatOrReconnect);
+
+  if (!state.traceBuffers.has(hop.traceId)) {
+    state.traceBuffers.set(hop.traceId, []);
   }
+  state.traceBuffers.get(hop.traceId).push(hop);
+  scheduleTracePlayback(hop.traceId, hop.flow);
 }
 
 function connectTraceStream() {
@@ -186,11 +289,7 @@ el.btnReplay.addEventListener('click', async () => {
   el.btnReplay.disabled = true;
   el.btnReplay.textContent = 'Reproduzindo...';
 
-  const ordered = [...hops].sort((a, b) => (a.step || 0) - (b.step || 0));
-  for (const hop of ordered) {
-    animateHop(hop, 620, true);
-    await new Promise((r) => setTimeout(r, 680));
-  }
+  await playTraceSequence(hops, REPLAY_STAGGER_MS, REPLAY_DURATION_MS, true);
 
   state.replaying = false;
   el.btnReplay.disabled = false;
@@ -227,12 +326,30 @@ function addChatMessage(msg, recovered = false) {
   if (recovered) classes.push('is-recovered');
   row.className = classes.join(' ');
 
+  const avatar = document.createElement('div');
+  avatar.className = 'msg-avatar';
+  avatar.style.backgroundColor = colorForUser(msg.userId);
+  avatar.textContent = msg.userId.slice(0, 2).toUpperCase();
+
+  const contentWrap = document.createElement('div');
+  contentWrap.className = 'msg-content-wrap';
+
   const head = document.createElement('div');
   head.className = 'msg-head';
+
+  const authorWrap = document.createElement('span');
+  authorWrap.className = 'msg-author-wrap';
 
   const author = document.createElement('span');
   author.className = 'msg-author';
   author.textContent = msg.userId;
+
+  const gwChip = document.createElement('span');
+  gwChip.className = `gw-chip ${msg.gatewayId === 'gateway-2' ? 'gw-chip-2' : 'gw-chip-1'}`;
+  gwChip.textContent = msg.gatewayId;
+
+  authorWrap.appendChild(author);
+  authorWrap.appendChild(gwChip);
 
   const meta = document.createElement('span');
   meta.className = 'msg-meta';
@@ -241,29 +358,34 @@ function addChatMessage(msg, recovered = false) {
     minute: '2-digit',
     second: '2-digit',
   });
-  meta.textContent = `${msg.gatewayId} · #${msg.seqId} · ${time}${recovered ? ' · recuperada' : ''}`;
+  meta.textContent = `#${msg.seqId} · ${time}${recovered ? ' · recuperada' : ''}`;
 
-  head.appendChild(author);
+  head.appendChild(authorWrap);
   head.appendChild(meta);
 
   const body = document.createElement('div');
   body.className = 'msg-body';
   body.textContent = msg.content;
 
-  row.appendChild(head);
-  row.appendChild(body);
+  contentWrap.appendChild(head);
+  contentWrap.appendChild(body);
+  row.appendChild(avatar);
+  row.appendChild(contentWrap);
   el.chatMessages.appendChild(row);
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 }
 
 function updateMetaLine(connected) {
   if (connected) {
+    el.liveRing.className = 'live-ring is-live';
     el.connMeta.textContent = `${state.userId} · ${state.gatewayId} · #seq ${state.lastSeenSeqId}`;
     el.connMeta.className = 'meta-inline is-online';
   } else if (state.canReconnect) {
+    el.liveRing.className = 'live-ring is-saved';
     el.connMeta.textContent = `Desconectado (${state.userId} · #seq ${state.lastSeenSeqId})`;
     el.connMeta.className = 'meta-inline is-offline-saved';
   } else {
+    el.liveRing.className = 'live-ring';
     el.connMeta.textContent = 'Desconectado';
     el.connMeta.className = 'meta-inline';
   }
@@ -439,9 +561,9 @@ async function pollNotifications() {
       }
     }
 
-    el.pollTotal.textContent = String(state.pollStats.total);
-    el.pollHits.textContent = String(state.pollStats.hits);
-    el.pollEmpty.textContent = String(state.pollStats.empty);
+    tickMetric(el.pollTotal, String(state.pollStats.total));
+    tickMetric(el.pollHits, String(state.pollStats.hits));
+    tickMetric(el.pollEmpty, String(state.pollStats.empty));
   } catch {
     // ignore transient poll error
   }
@@ -461,9 +583,9 @@ async function refreshCluster() {
     const gw1 = data.summaryByGateway['gateway-1'] || 0;
     const gw2 = data.summaryByGateway['gateway-2'] || 0;
 
-    el.clusterGw1.textContent = String(gw1);
-    el.clusterGw2.textContent = String(gw2);
-    el.clusterRing.textContent = `${data.ringBufferSize}/${data.ringBufferCapacity}`;
+    tickMetric(el.clusterGw1, String(gw1));
+    tickMetric(el.clusterGw2, String(gw2));
+    tickMetric(el.clusterRing, `${data.ringBufferSize}/${data.ringBufferCapacity}`);
 
     el.svgGw1Count.textContent = `${gw1} conexões`;
     el.svgGw2Count.textContent = `${gw2} conexões`;
@@ -487,7 +609,7 @@ async function refreshCluster() {
       left.textContent = session.userId;
 
       const right = document.createElement('span');
-      right.className = 'feed-gw';
+      right.className = `gw-chip ${session.gatewayId === 'gateway-2' ? 'gw-chip-2' : 'gw-chip-1'}`;
       right.textContent = session.gatewayId;
 
       row.appendChild(left);
