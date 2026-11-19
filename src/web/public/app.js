@@ -107,13 +107,6 @@ function colorForUser(name) {
   return AVATAR_PALETTE[hash % AVATAR_PALETTE.length];
 }
 
-function tickMetric(elm, newText) {
-  if (elm.textContent === newText) return;
-  elm.textContent = newText;
-  elm.classList.add('tick');
-  setTimeout(() => elm.classList.remove('tick'), 180);
-}
-
 function flashNode(nodeId, flow, durationMs) {
   const node = document.getElementById(`node-${nodeId}`);
   if (!node) return;
@@ -561,9 +554,9 @@ async function pollNotifications() {
       }
     }
 
-    tickMetric(el.pollTotal, String(state.pollStats.total));
-    tickMetric(el.pollHits, String(state.pollStats.hits));
-    tickMetric(el.pollEmpty, String(state.pollStats.empty));
+    el.pollTotal.textContent = String(state.pollStats.total);
+    el.pollHits.textContent = String(state.pollStats.hits);
+    el.pollEmpty.textContent = String(state.pollStats.empty);
   } catch {
     // ignore transient poll error
   }
@@ -583,9 +576,9 @@ async function refreshCluster() {
     const gw1 = data.summaryByGateway['gateway-1'] || 0;
     const gw2 = data.summaryByGateway['gateway-2'] || 0;
 
-    tickMetric(el.clusterGw1, String(gw1));
-    tickMetric(el.clusterGw2, String(gw2));
-    tickMetric(el.clusterRing, `${data.ringBufferSize}/${data.ringBufferCapacity}`);
+    el.clusterGw1.textContent = String(gw1);
+    el.clusterGw2.textContent = String(gw2);
+    el.clusterRing.textContent = `${data.ringBufferSize}/${data.ringBufferCapacity}`;
 
     el.svgGw1Count.textContent = `${gw1} conexões`;
     el.svgGw2Count.textContent = `${gw2} conexões`;

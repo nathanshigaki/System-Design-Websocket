@@ -16,7 +16,22 @@
   --r-panel: 8px;
   --r-ctrl: 6px;
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
-  --ease-enter: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* transitions.dev motion tokens */
+  --duration-stagger: 40ms;
+  --duration-micro: 80ms;
+  --duration-quick: 150ms;
+  --duration-fast: 250ms;
+  --duration-slow: 400ms;
+  --duration-very-slow: 500ms;
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-enter: var(--ease-smooth-out);
+  --distance-micro: 4px;
+  --distance-base: 8px;
+  --distance-medium: 12px;
+  --scale-tiny: 0.99;
+  --blur-small: 2px;
+  --blur-medium: 3px;
 }
 
 * {
@@ -59,25 +74,75 @@ code {
   padding-right: 20px;
 }
 
-/* ENTRADA INICIAL SUAVE */
-@keyframes blockEnter {
+/* ENTRADA AO CARREGAR O SITE (transitions.dev) */
+@keyframes headerEnter {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(calc(-1 * var(--distance-micro)));
+    filter: blur(var(--blur-medium));
   }
   to {
     opacity: 1;
     transform: translateY(0);
+    filter: blur(0);
   }
 }
 
-.enter-block {
-  animation: blockEnter 420ms var(--ease-enter) both;
+@keyframes panelEnter {
+  from {
+    opacity: 0;
+    transform: translateY(var(--distance-medium)) scale(var(--scale-tiny));
+    filter: blur(var(--blur-small));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
 }
 
-.enter-delay {
-  animation-delay: 80ms;
+@keyframes svgColEnter {
+  from {
+    opacity: 0;
+    translate: 0 var(--distance-base);
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
 }
+
+@keyframes routeEnter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 0.34;
+  }
+}
+
+.enter-header {
+  animation: headerEnter var(--duration-very-slow) var(--ease-smooth-out) both;
+}
+
+.enter-panel {
+  animation: panelEnter var(--duration-slow) var(--ease-smooth-out) both;
+}
+
+.enter-1 { animation-delay: 40ms; }
+.enter-2 { animation-delay: 100ms; }
+.enter-3 { animation-delay: 160ms; }
+.enter-4 { animation-delay: 220ms; }
+
+.svg-col {
+  animation: svgColEnter var(--duration-slow) var(--ease-smooth-out) both;
+}
+
+.svg-col-1 { animation-delay: 240ms; }
+.svg-col-2 { animation-delay: 290ms; }
+.svg-col-3 { animation-delay: 340ms; }
+.svg-col-4 { animation-delay: 390ms; }
+.svg-col-5 { animation-delay: 440ms; }
 
 /* HEADER */
 .topbar {
@@ -517,11 +582,6 @@ input[type="text"]:disabled {
   font-size: 1.08rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  transition: transform 160ms var(--ease);
-}
-
-.metric-val.tick {
-  transform: scale(1.08);
 }
 
 .val-green { color: var(--green); }
@@ -545,7 +605,6 @@ input[type="text"]:disabled {
   padding: 7px 2px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.08);
   font-size: 0.82rem;
-  animation: rowIn 180ms var(--ease-enter) both;
 }
 
 .feed-row:last-child {
@@ -644,7 +703,8 @@ input[type="text"]:disabled {
   fill: none;
   stroke-width: 2;
   opacity: 0.34;
-  transition: opacity 180ms var(--ease), stroke-width 180ms var(--ease);
+  animation: routeEnter var(--duration-slow) var(--ease-smooth-out) 420ms backwards;
+  transition: opacity var(--duration-quick) var(--ease), stroke-width var(--duration-quick) var(--ease);
 }
 
 .route-ws { stroke: var(--accent); }
@@ -719,10 +779,12 @@ input[type="text"]:disabled {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .enter-block,
+  .enter-header,
+  .enter-panel,
+  .svg-col,
+  .route-line,
   .msg-row,
   .msg-system,
-  .feed-row,
   .sync-notice,
   .live-ring.is-live::after {
     animation: none !important;

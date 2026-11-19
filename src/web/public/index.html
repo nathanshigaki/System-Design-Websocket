@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <header class="topbar">
+  <header class="topbar enter-header">
     <div class="wrap topbar-inner">
       <h1>Arquitetura Distribuída WebSocket</h1>
       <a id="haproxy-link" class="header-link" href="http://localhost:8404" target="_blank" rel="noopener">
@@ -18,9 +18,9 @@
 
   <main class="wrap page-main">
     <!-- SEÇÃO SUPERIOR (PRINCIPAL): CHAT + PAINEL LATERAL COMPACTO -->
-    <section class="workspace-grid enter-block" aria-label="Sala WebSocket e Monitoramento">
+    <section class="workspace-grid" aria-label="Sala WebSocket e Monitoramento">
       <!-- CHAT PRINCIPAL -->
-      <div class="panel chat-panel">
+      <div class="panel chat-panel enter-panel enter-1">
         <div class="panel-head">
           <div class="chat-title-row">
             <span id="live-ring" class="live-ring" aria-hidden="true"></span>
@@ -65,7 +65,7 @@
 
       <!-- COLUNA LATERAL COMPACTA: SHORT POLLING + CLUSTER -->
       <aside class="side-rail">
-        <div class="panel panel-polling">
+        <div class="panel panel-polling enter-panel enter-2">
           <div class="panel-head compact-head">
             <div class="title-with-dot">
               <span class="dot-tag dot-amber"></span>
@@ -96,7 +96,7 @@
           </div>
         </div>
 
-        <div class="panel panel-cluster">
+        <div class="panel panel-cluster enter-panel enter-3">
           <div class="panel-head compact-head">
             <div class="title-with-dot">
               <span class="dot-tag dot-blue"></span>
@@ -127,7 +127,7 @@
     </section>
 
     <!-- SEÇÃO INFERIOR: MAPA AO VIVO DA ARQUITETURA -->
-    <section class="panel map-panel enter-block enter-delay" aria-label="Rotas da Arquitetura">
+    <section class="panel map-panel enter-panel enter-4" aria-label="Rotas da Arquitetura">
       <div class="panel-head">
         <div class="map-head-left">
           <h2>Rotas da Arquitetura (Ao Vivo)</h2>
@@ -197,7 +197,7 @@
           <path id="path-postgres-gw2" class="route-line route-rec" d="M 935 285 C 820 345, 690 340, 620 285" marker-end="url(#arrow-rec)" />
 
           <!-- NÓS DA ARQUITETURA -->
-          <g id="node-client" class="arch-node node-client">
+          <g id="node-client" class="arch-node node-client svg-col svg-col-1">
             <rect class="node-box" x="20" y="130" width="145" height="90" rx="6" />
             <rect class="node-strip" x="20" y="130" width="145" height="3" rx="1.5" fill="#94a3b8" />
             <text x="92" y="160" class="node-title">Clientes</text>
@@ -205,7 +205,7 @@
             <text x="92" y="200" class="node-port">WSS / HTTP</text>
           </g>
 
-          <g id="node-web" class="arch-node node-web">
+          <g id="node-web" class="arch-node node-web svg-col svg-col-2">
             <rect class="node-box" x="235" y="50" width="150" height="80" rx="6" />
             <rect class="node-strip" x="235" y="50" width="150" height="3" rx="1.5" fill="#22c55e" />
             <text x="310" y="78" class="node-title">Web &amp; Proxy</text>
@@ -213,7 +213,7 @@
             <text x="310" y="114" class="node-port">/ws • /api/notifications</text>
           </g>
 
-          <g id="node-haproxy" class="arch-node node-haproxy">
+          <g id="node-haproxy" class="arch-node node-haproxy svg-col svg-col-2">
             <rect class="node-box" x="235" y="210" width="150" height="85" rx="6" />
             <rect class="node-strip" x="235" y="210" width="150" height="3" rx="1.5" fill="#06b6d4" />
             <text x="310" y="238" class="node-title">HAProxy L4</text>
@@ -221,7 +221,7 @@
             <text x="310" y="275" class="node-port">:8080 (Stats :8404)</text>
           </g>
 
-          <g id="node-gateway-1" class="arch-node node-gw1">
+          <g id="node-gateway-1" class="arch-node node-gw1 svg-col svg-col-3">
             <rect class="node-box" x="460" y="65" width="160" height="85" rx="6" />
             <rect class="node-strip" x="460" y="65" width="160" height="3" rx="1.5" fill="#38bdf8" />
             <text x="540" y="92" class="node-title">Gateway 1</text>
@@ -229,7 +229,7 @@
             <text id="svg-gw1-count" x="540" y="132" class="node-badge badge-sky">0 conexões</text>
           </g>
 
-          <g id="node-gateway-2" class="arch-node node-gw2">
+          <g id="node-gateway-2" class="arch-node node-gw2 svg-col svg-col-3">
             <rect class="node-box" x="460" y="225" width="160" height="85" rx="6" />
             <rect class="node-strip" x="460" y="225" width="160" height="3" rx="1.5" fill="#14b8a6" />
             <text x="540" y="252" class="node-title">Gateway 2</text>
@@ -237,7 +237,7 @@
             <text id="svg-gw2-count" x="540" y="292" class="node-badge badge-teal">0 conexões</text>
           </g>
 
-          <g id="node-redis" class="arch-node node-redis">
+          <g id="node-redis" class="arch-node node-redis svg-col svg-col-4">
             <rect class="node-box" x="690" y="95" width="175" height="175" rx="6" />
             <rect class="node-strip" x="690" y="95" width="175" height="3" rx="1.5" fill="#f43f5e" />
             <text x="777" y="122" class="node-title">Redis 7 (:6379)</text>
@@ -248,7 +248,7 @@
             <text id="svg-seq-count" x="777" y="246" class="node-badge">#seqId: 0</text>
           </g>
 
-          <g id="node-worker" class="arch-node node-worker">
+          <g id="node-worker" class="arch-node node-worker svg-col svg-col-5">
             <rect class="node-box" x="935" y="65" width="165" height="85" rx="6" />
             <rect class="node-strip" x="935" y="65" width="165" height="3" rx="1.5" fill="#3b82f6" />
             <text x="1017" y="92" class="node-title">Smart Worker</text>
@@ -256,7 +256,7 @@
             <text x="1017" y="130" class="node-port">Regra + seqId + DB</text>
           </g>
 
-          <g id="node-postgres" class="arch-node node-pg">
+          <g id="node-postgres" class="arch-node node-pg svg-col svg-col-5">
             <rect class="node-box" x="935" y="215" width="165" height="90" rx="6" />
             <rect class="node-strip" x="935" y="215" width="165" height="3" rx="1.5" fill="#f59e0b" />
             <text x="1017" y="244" class="node-title">PostgreSQL 16</text>
