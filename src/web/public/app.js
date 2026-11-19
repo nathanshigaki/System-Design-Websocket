@@ -8,7 +8,7 @@ const state = {
   userId: '',
   gatewayId: '',
   lastSeenSeqId: 0,
-  simulatedDrop: false,
+  canReconnect: false,
   seenSeqIds: new Set(),
   pollingEnabled: true,
   lastNotificationId: 0,
@@ -19,26 +19,13 @@ const state = {
 };
 
 const el = {
-  traceStatus: document.getElementById('trace-status'),
   haproxyLink: document.getElementById('haproxy-link'),
-  togglePollingAnim: document.getElementById('toggle-polling-anim'),
-  btnReplay: document.getElementById('btn-replay'),
-  traceBanner: document.getElementById('trace-step-banner'),
-  traceLog: document.getElementById('trace-log'),
-  packetsLayer: document.getElementById('packets-layer'),
-  svgGw1Count: document.getElementById('svg-gw1-count'),
-  svgGw2Count: document.getElementById('svg-gw2-count'),
-  svgRingCount: document.getElementById('svg-ring-count'),
-  svgSeqCount: document.getElementById('svg-seq-count'),
+  connMeta: document.getElementById('conn-meta'),
   connectForm: document.getElementById('connect-form'),
   usernameInput: document.getElementById('username-input'),
   btnConnect: document.getElementById('btn-connect'),
-  btnSimulateDrop: document.getElementById('btn-simulate-drop'),
-  btnNewTab: document.getElementById('btn-new-tab'),
-  wsConnBadge: document.getElementById('ws-conn-badge'),
-  wsGwBadge: document.getElementById('ws-gw-badge'),
-  wsSeqBadge: document.getElementById('ws-seq-badge'),
-  wsRecoveryBadge: document.getElementById('ws-recovery-badge'),
+  btnSwitchUser: document.getElementById('btn-switch-user'),
+  syncNotice: document.getElementById('sync-notice'),
   chatMessages: document.getElementById('chat-messages'),
   chatForm: document.getElementById('chat-form'),
   messageInput: document.getElementById('message-input'),
@@ -52,10 +39,18 @@ const el = {
   clusterGw2: document.getElementById('cluster-gw2'),
   clusterRing: document.getElementById('cluster-ring'),
   sessionList: document.getElementById('session-list'),
+  togglePollingAnim: document.getElementById('toggle-polling-anim'),
+  btnReplay: document.getElementById('btn-replay'),
+  packetsLayer: document.getElementById('packets-layer'),
+  traceBanner: document.getElementById('trace-step-banner'),
+  svgGw1Count: document.getElementById('svg-gw1-count'),
+  svgGw2Count: document.getElementById('svg-gw2-count'),
+  svgRingCount: document.getElementById('svg-ring-count'),
+  svgSeqCount: document.getElementById('svg-seq-count'),
 };
 
 if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-  el.haproxyLink.style.display = 'none';
+  el.haproxyLink.classList.add('hidden');
 }
 
 const ROUTE_MAP = {
@@ -82,7 +77,7 @@ const ROUTE_MAP = {
 };
 
 const FLOW_COLORS = {
-  websocket: '#38bdf8',
+  websocket: '#3b82f6',
   polling: '#f59e0b',
   reconnect: '#22c55e',
 };
@@ -97,29 +92,31 @@ function flashNode(nodeId, flow) {
         ? 'active-reconnect'
         : 'active';
   node.classList.add(cls);
-  setTimeout(() => node.classList.remove(cls), 550);
+  setTimeout(() => node.classList.remove(cls), 520);
 }
 
-function animateHop(hop, durationMs = 420) {
+function animateHop(hop, durationMs = 400, updateText = false) {
   const route = ROUTE_MAP[`${hop.from}->${hop.to}`];
   flashNode(hop.from, hop.flow);
   flashNode(hop.to, hop.flow);
 
-  el.traceBanner.textContent = `[${hop.flow.toUpperCase()}] ${hop.from} -> ${hop.to} (${hop.protocol}): ${hop.detail}`;
+  if (updateText) {
+    el.traceBanner.textContent = `${hop.from} -> ${hop.to} (${hop.protocol}): ${hop.detail}`;
+  }
 
   if (!route) return;
   const pathEl = document.getElementById(route.pathId);
   if (!pathEl) return;
 
   pathEl.classList.add('active');
-  setTimeout(() => pathEl.classList.remove('active'), durationMs + 120);
+  setTimeout(() => pathEl.classList.remove('active'), durationMs + 100);
 
   const totalLength = pathEl.getTotalLength();
   const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-  circle.setAttribute('r', '6');
-  circle.setAttribute('fill', FLOW_COLORS[hop.flow] || '#38bdf8');
-  circle.setAttribute('stroke', '#ffffff');
-  circle.setAttribute('stroke-width', '1.5');
+  circle.setAttribute('r', '5.5');
+  circle.setAttribute('fill', FLOW_COLORS[hop.flow] || '#3b82f6');
+  circle.setAttribute('stroke', '#f8fafc');
+  circle.setAttribute('stroke-width', '1.4');
   el.packetsLayer.appendChild(circle);
 
   const start = performance.now();
@@ -138,18 +135,9 @@ function animateHop(hop, durationMs = 420) {
   requestAnimationFrame(frame);
 }
 
-function appendTraceChip(hop) {
-  const chip = document.createElement('span');
-  chip.className = 'trace-chip';
-  chip.textContent = `${hop.from} -> ${hop.to} (${hop.protocol})`;
-  el.traceLog.prepend(chip);
-  while (el.traceLog.children.length > 14) {
-    el.traceLog.lastChild.remove();
-  }
-}
-
 function recordTraceHop(hop) {
-  if (hop.flow === 'websocket' || hop.flow === 'reconnect') {
+  const isChatOrReconnect = hop.flow === 'websocket' || hop.flow === 'reconnect';
+  if (isChatOrReconnect) {
     if (!state.tracesById.has(hop.traceId)) {
       state.tracesById.set(hop.traceId, []);
       if (state.tracesById.size > 20) {
@@ -165,9 +153,8 @@ function recordTraceHop(hop) {
   if (hop.flow === 'polling' && !el.togglePollingAnim.checked) {
     return;
   }
-  appendTraceChip(hop);
   if (!state.replaying) {
-    animateHop(hop, 400);
+    animateHop(hop, 380, isChatOrReconnect);
   }
 }
 
@@ -175,10 +162,6 @@ function connectTraceStream() {
   const ws = new WebSocket(TRACE_WS_URL);
   state.traceWs = ws;
 
-  ws.onopen = () => {
-    el.traceStatus.textContent = 'Trace: conectado';
-    el.traceStatus.className = 'pill pill-ok';
-  };
   ws.onmessage = (event) => {
     try {
       const hop = JSON.parse(event.data);
@@ -190,8 +173,6 @@ function connectTraceStream() {
     }
   };
   ws.onclose = () => {
-    el.traceStatus.textContent = 'Trace: reconectando...';
-    el.traceStatus.className = 'pill pill-warn';
     setTimeout(connectTraceStream, 2000);
   };
 }
@@ -207,13 +188,13 @@ el.btnReplay.addEventListener('click', async () => {
 
   const ordered = [...hops].sort((a, b) => (a.step || 0) - (b.step || 0));
   for (const hop of ordered) {
-    animateHop(hop, 620);
+    animateHop(hop, 620, true);
     await new Promise((r) => setTimeout(r, 680));
   }
 
   state.replaying = false;
   el.btnReplay.disabled = false;
-  el.btnReplay.textContent = 'Replay Última Rota (Câmera Lenta)';
+  el.btnReplay.textContent = 'Replay (Câmera Lenta)';
 });
 
 function clearEmptyState(container) {
@@ -235,68 +216,80 @@ function addChatMessage(msg, recovered = false) {
   state.seenSeqIds.add(msg.seqId);
   if (msg.seqId > state.lastSeenSeqId) {
     state.lastSeenSeqId = msg.seqId;
-    el.wsSeqBadge.textContent = `#seqId: ${state.lastSeenSeqId}`;
+    updateMetaLine(Boolean(state.ws));
   }
 
   clearEmptyState(el.chatMessages);
-  const card = document.createElement('div');
-  card.className = recovered ? 'msg-item msg-recovered' : 'msg-item';
 
-  const meta = document.createElement('div');
-  meta.className = 'msg-meta';
+  const row = document.createElement('div');
+  const classes = ['msg-row'];
+  if (msg.userId === state.userId) classes.push('is-own');
+  if (recovered) classes.push('is-recovered');
+  row.className = classes.join(' ');
 
-  const left = document.createElement('span');
+  const head = document.createElement('div');
+  head.className = 'msg-head';
+
   const author = document.createElement('span');
   author.className = 'msg-author';
   author.textContent = msg.userId;
-  left.appendChild(author);
-  left.appendChild(document.createTextNode(` • via ${msg.gatewayId}`));
-  if (recovered) {
-    left.appendChild(document.createTextNode(' • [recuperada]'));
-  }
 
-  const right = document.createElement('span');
-  const time = new Date(msg.createdAt).toLocaleTimeString('pt-BR');
-  right.textContent = `#${msg.seqId} • ${time}`;
+  const meta = document.createElement('span');
+  meta.className = 'msg-meta';
+  const time = new Date(msg.createdAt).toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  meta.textContent = `${msg.gatewayId} · #${msg.seqId} · ${time}${recovered ? ' · recuperada' : ''}`;
 
-  meta.appendChild(left);
-  meta.appendChild(right);
+  head.appendChild(author);
+  head.appendChild(meta);
 
   const body = document.createElement('div');
-  body.className = 'msg-text';
+  body.className = 'msg-body';
   body.textContent = msg.content;
 
-  card.appendChild(meta);
-  card.appendChild(body);
-  el.chatMessages.appendChild(card);
+  row.appendChild(head);
+  row.appendChild(body);
+  el.chatMessages.appendChild(row);
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+}
+
+function updateMetaLine(connected) {
+  if (connected) {
+    el.connMeta.textContent = `${state.userId} · ${state.gatewayId} · #seq ${state.lastSeenSeqId}`;
+    el.connMeta.className = 'meta-inline is-online';
+  } else if (state.canReconnect) {
+    el.connMeta.textContent = `Desconectado (${state.userId} · #seq ${state.lastSeenSeqId})`;
+    el.connMeta.className = 'meta-inline is-offline-saved';
+  } else {
+    el.connMeta.textContent = 'Desconectado';
+    el.connMeta.className = 'meta-inline';
+  }
 }
 
 function updateConnectionUi(connected) {
   el.messageInput.disabled = !connected;
   el.btnSend.disabled = !connected;
-  el.btnSimulateDrop.disabled = !connected && !state.simulatedDrop;
+  updateMetaLine(connected);
 
   if (connected) {
-    el.wsConnBadge.textContent = `Conectado (${state.userId})`;
-    el.wsConnBadge.className = 'pill pill-ok';
+    el.usernameInput.classList.add('hidden');
+    el.btnSwitchUser.classList.add('hidden');
     el.btnConnect.textContent = 'Desconectar';
-    el.btnSimulateDrop.textContent = 'Simular Queda';
-    el.btnSimulateDrop.disabled = false;
-  } else if (state.simulatedDrop) {
-    el.wsConnBadge.textContent = `Queda simulada (${state.userId})`;
-    el.wsConnBadge.className = 'pill pill-warn';
-    el.btnConnect.textContent = 'Cancelar';
-    el.btnSimulateDrop.textContent = 'Reconectar (lastSeenSeqId)';
-    el.btnSimulateDrop.disabled = false;
+    el.btnConnect.className = 'btn btn-secondary';
+  } else if (state.canReconnect) {
+    el.usernameInput.classList.add('hidden');
+    el.btnSwitchUser.classList.remove('hidden');
+    el.btnConnect.textContent = 'Reconectar';
+    el.btnConnect.className = 'btn btn-primary';
   } else {
-    el.wsConnBadge.textContent = 'Desconectado';
-    el.wsConnBadge.className = 'pill pill-muted';
-    el.wsGwBadge.textContent = 'Gateway: —';
-    el.wsGwBadge.className = 'pill pill-muted';
+    el.usernameInput.classList.remove('hidden');
+    el.usernameInput.disabled = false;
+    el.btnSwitchUser.classList.add('hidden');
     el.btnConnect.textContent = 'Conectar';
-    el.btnSimulateDrop.textContent = 'Simular Queda';
-    el.btnSimulateDrop.disabled = true;
+    el.btnConnect.className = 'btn btn-primary';
   }
 }
 
@@ -314,12 +307,10 @@ function openChatSocket(useLastSeq = false) {
 
     if (msg.type === 'welcome') {
       state.gatewayId = msg.gatewayId;
+      state.canReconnect = true;
       if (!useLastSeq && msg.currentSeqId > state.lastSeenSeqId) {
         state.lastSeenSeqId = msg.currentSeqId;
-        el.wsSeqBadge.textContent = `#seqId: ${state.lastSeenSeqId}`;
       }
-      el.wsGwBadge.textContent = `Gateway: ${msg.gatewayId}`;
-      el.wsGwBadge.className = 'pill pill-blue';
       updateConnectionUi(true);
       refreshCluster();
       return;
@@ -336,16 +327,15 @@ function openChatSocket(useLastSeq = false) {
       const labels = {
         ring_buffer: 'Ring Buffer Redis (0 queries no DB)',
         postgres_offline: 'Fallback PostgreSQL (offline longo)',
-        up_to_date: 'Sem mensagens perdidas',
+        up_to_date: 'Nenhuma mensagem perdida',
       };
-      el.wsRecoveryBadge.textContent = `Sync: ${labels[msg.recoverySource] || msg.recoverySource}`;
-      el.wsRecoveryBadge.className = 'pill pill-ok';
+      const label = labels[msg.recoverySource] || msg.recoverySource;
+      el.syncNotice.textContent = `Reconexão: ${label} · ${msg.messages.length} msg(s) recuperada(s).`;
+      el.syncNotice.classList.remove('hidden');
+
       for (const item of msg.messages || []) {
         addChatMessage(item, true);
       }
-      addSystemLine(
-        `Reconexão concluída (${labels[msg.recoverySource] || msg.recoverySource}) — ${msg.messages.length} msg(s) recuperadas.`
-      );
       return;
     }
 
@@ -366,13 +356,13 @@ function openChatSocket(useLastSeq = false) {
 el.connectForm.addEventListener('submit', (e) => {
   e.preventDefault();
   if (state.ws) {
-    state.simulatedDrop = false;
     state.ws.close(1000, 'User disconnect');
+    addSystemLine(`Desconectado mantendo #seq ${state.lastSeenSeqId}. Clique em Reconectar para testar o Ring Buffer.`);
     return;
   }
-  if (state.simulatedDrop) {
-    state.simulatedDrop = false;
-    updateConnectionUi(false);
+
+  if (state.canReconnect && state.userId) {
+    openChatSocket(true);
     return;
   }
 
@@ -381,22 +371,23 @@ el.connectForm.addEventListener('submit', (e) => {
   state.userId = name;
   state.seenSeqIds.clear();
   state.lastSeenSeqId = 0;
-  el.wsRecoveryBadge.className = 'pill pill-hidden';
+  state.canReconnect = false;
+  el.syncNotice.classList.add('hidden');
   el.chatMessages.innerHTML = '';
   openChatSocket(false);
 });
 
-el.btnSimulateDrop.addEventListener('click', () => {
-  if (state.ws) {
-    state.simulatedDrop = true;
-    state.ws.close(1000, 'Simulated drop');
-    addSystemLine(`Queda simulada! Último #seqId visto: ${state.lastSeenSeqId}.`);
-    return;
-  }
-  if (state.simulatedDrop) {
-    state.simulatedDrop = false;
-    openChatSocket(true);
-  }
+el.btnSwitchUser.addEventListener('click', () => {
+  state.userId = '';
+  state.gatewayId = '';
+  state.lastSeenSeqId = 0;
+  state.canReconnect = false;
+  state.seenSeqIds.clear();
+  el.syncNotice.classList.add('hidden');
+  el.chatMessages.innerHTML =
+    '<div class="empty-state">Entre com um nome acima para conectar na sala WebSocket.</div>';
+  updateConnectionUi(false);
+  el.usernameInput.focus();
 });
 
 el.chatForm.addEventListener('submit', (e) => {
@@ -407,10 +398,6 @@ el.chatForm.addEventListener('submit', (e) => {
   state.ws.send(JSON.stringify({ type: 'chat_message', content }));
   el.messageInput.value = '';
   el.messageInput.focus();
-});
-
-el.btnNewTab.addEventListener('click', () => {
-  window.open(window.location.href, '_blank');
 });
 
 async function pollNotifications() {
@@ -426,20 +413,28 @@ async function pollNotifications() {
     } else {
       state.pollStats.hits += 1;
       state.lastNotificationId = data.lastId;
-      clearEmptyState(el.pollList);
       for (const item of data.notifications) {
+        if (item.type === 'message') continue;
+        clearEmptyState(el.pollList);
         const row = document.createElement('div');
-        row.className = 'list-row';
+        row.className = 'feed-row';
+
         const msgSpan = document.createElement('span');
         msgSpan.textContent = item.message;
+
         const timeSpan = document.createElement('span');
-        timeSpan.style.color = '#94a3b8';
-        timeSpan.textContent = new Date(item.createdAt).toLocaleTimeString('pt-BR');
+        timeSpan.className = 'feed-time';
+        timeSpan.textContent = new Date(item.createdAt).toLocaleTimeString('pt-BR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+
         row.appendChild(msgSpan);
         row.appendChild(timeSpan);
         el.pollList.prepend(row);
       }
-      while (el.pollList.children.length > 20) {
+      while (el.pollList.children.length > 15) {
         el.pollList.lastChild.remove();
       }
     }
@@ -454,7 +449,7 @@ async function pollNotifications() {
 
 el.btnTogglePolling.addEventListener('click', () => {
   state.pollingEnabled = !state.pollingEnabled;
-  el.btnTogglePolling.textContent = state.pollingEnabled ? 'Pausar Polling' : 'Retomar Polling';
+  el.btnTogglePolling.textContent = state.pollingEnabled ? 'Pausar' : 'Retomar';
 });
 
 async function refreshCluster() {
@@ -468,30 +463,33 @@ async function refreshCluster() {
 
     el.clusterGw1.textContent = String(gw1);
     el.clusterGw2.textContent = String(gw2);
-    el.clusterRing.textContent = `${data.ringBufferSize} / ${data.ringBufferCapacity}`;
+    el.clusterRing.textContent = `${data.ringBufferSize}/${data.ringBufferCapacity}`;
 
     el.svgGw1Count.textContent = `${gw1} conexões`;
     el.svgGw2Count.textContent = `${gw2} conexões`;
-    el.svgRingCount.textContent = `• Ring Buffer (${data.ringBufferSize}/${data.ringBufferCapacity})`;
-    el.svgSeqCount.textContent = `#seqId atual: ${data.currentSeqId}`;
+    el.svgRingCount.textContent = `Ring Buffer (${data.ringBufferSize}/${data.ringBufferCapacity})`;
+    el.svgSeqCount.textContent = `#seqId: ${data.currentSeqId}`;
 
     el.sessionList.innerHTML = '';
     if (!data.sessions || data.sessions.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.textContent = 'Nenhuma sessão ativa no momento.';
+      empty.textContent = 'Nenhuma sessão ativa.';
       el.sessionList.appendChild(empty);
       return;
     }
 
     for (const session of data.sessions) {
       const row = document.createElement('div');
-      row.className = 'list-row';
+      row.className = 'feed-row';
+
       const left = document.createElement('span');
       left.textContent = session.userId;
+
       const right = document.createElement('span');
-      right.className = 'pill pill-blue';
+      right.className = 'feed-gw';
       right.textContent = session.gatewayId;
+
       row.appendChild(left);
       row.appendChild(right);
       el.sessionList.appendChild(row);
