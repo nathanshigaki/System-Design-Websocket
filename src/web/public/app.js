@@ -6,6 +6,7 @@ const STEP_STAGGER_MS = 260;
 const HOP_DURATION_MS = 320;
 const REPLAY_STAGGER_MS = 680;
 const REPLAY_DURATION_MS = 600;
+const MAX_VISIBLE_AVATARS = 6;
 
 const AVATAR_PALETTE = [
   '#38bdf8',
@@ -34,12 +35,14 @@ const state = {
   replaying: false,
   connVisualMode: 'disconnected',
   connSwapTimer: null,
+  lastAvatarSignature: '',
 };
 
 const el = {
   haproxyLink: document.getElementById('haproxy-link'),
   liveRing: document.getElementById('live-ring'),
   connMeta: document.getElementById('conn-meta'),
+  roomAvatars: document.getElementById('room-avatars'),
   connectForm: document.getElementById('connect-form'),
   usernameInput: document.getElementById('username-input'),
   btnConnect: document.getElementById('btn-connect'),
@@ -619,11 +622,88 @@ el.btnTogglePolling.addEventListener('click', () => {
   el.btnTogglePolling.textContent = state.pollingEnabled ? 'Pausar' : 'Retomar';
 });
 
+function applyAvatarShifts(avatars, activeIdx, phase) {
+  const cs = getComputedStyle(document.documentElement);
+  const num = (name, fb) => {
+    const v = parseFloat(cs.getPropertyValue(name));
+    return Number.isFinite(v) ? v : fb;
+  };
+  const ease = (name, fb) => cs.getPropertyValue(name).trim() || fb;
+
+  const lift = num('--avatar-lift', -4);
+  const falloff = num('--avatar-falloff', 0.45);
+  const scale = num('--avatar-scale', 1.05);
+  const tf =
+    phase === 'out'
+      ? ease('--avatar-ease-out', 'cubic-bezier(0.34, 3.85, 0.64, 1)')
+      : ease('--avatar-ease-in', 'cubic-bezier(0.22, 1, 0.36, 1)');
+
+  avatars.forEach((avatarEl, idx) => {
+    avatarEl.style.transitionTimingFunction = tf;
+    if (activeIdx == null) {
+      avatarEl.style.setProperty('--shift', '0px');
+      avatarEl.style.setProperty('--scale-active', '1');
+      return;
+    }
+    const dist = Math.abs(idx - activeIdx);
+    avatarEl.style.setProperty(
+      '--shift',
+      `${(lift * Math.pow(falloff, dist)).toFixed(3)}px`
+    );
+    avatarEl.style.setProperty('--scale-active', idx === activeIdx ? String(scale) : '1');
+  });
+}
+
+function renderAvatarGroup(sessions) {
+  const signature = sessions.map((s) => `${s.userId}:${s.gatewayId}`).join('|');
+  if (signature === state.lastAvatarSignature) return;
+  state.lastAvatarSignature = signature;
+
+  el.roomAvatars.innerHTML = '';
+  if (sessions.length === 0) {
+    el.roomAvatars.classList.add('hidden');
+    return;
+  }
+
+  el.roomAvatars.classList.remove('hidden');
+  const visible = sessions.slice(0, MAX_VISIBLE_AVATARS);
+  const overflowCount = sessions.length - visible.length;
+  const avatarEls = [];
+
+  for (const session of visible) {
+    const item = document.createElement('div');
+    item.className = 't-avatar';
+    item.style.backgroundColor = colorForUser(session.userId);
+    item.textContent = session.userId.slice(0, 2).toUpperCase();
+    item.title = `${session.userId} (${session.gatewayId})`;
+    el.roomAvatars.appendChild(item);
+    avatarEls.push(item);
+  }
+
+  if (overflowCount > 0) {
+    const extra = document.createElement('div');
+    extra.className = 't-avatar avatar-overflow';
+    extra.textContent = `+${overflowCount}`;
+    extra.title = sessions
+      .slice(MAX_VISIBLE_AVATARS)
+      .map((s) => `${s.userId} (${s.gatewayId})`)
+      .join(', ');
+    el.roomAvatars.appendChild(extra);
+    avatarEls.push(extra);
+  }
+
+  avatarEls.forEach((avatarEl, idx) => {
+    avatarEl.addEventListener('mouseenter', () => applyAvatarShifts(avatarEls, idx, 'in'));
+  });
+  el.roomAvatars.onmouseleave = () => applyAvatarShifts(avatarEls, null, 'out');
+}
+
 async function refreshCluster() {
   try {
     const res = await fetch('/api/cluster');
     if (!res.ok) return;
     const data = await res.json();
+    const sessions = data.sessions || [];
 
     const gw1 = data.summaryByGateway['gateway-1'] || 0;
     const gw2 = data.summaryByGateway['gateway-2'] || 0;
@@ -637,8 +717,10 @@ async function refreshCluster() {
     el.svgRingCount.textContent = `• Ring Buffer (${data.ringBufferSize}/${data.ringBufferCapacity})`;
     el.svgSeqCount.textContent = `#seqId: ${data.currentSeqId}`;
 
+    renderAvatarGroup(sessions);
+
     el.sessionList.innerHTML = '';
-    if (!data.sessions || data.sessions.length === 0) {
+    if (sessions.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty-state';
       empty.textContent = 'Nenhuma sessão ativa.';
