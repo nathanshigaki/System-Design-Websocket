@@ -10,8 +10,14 @@
   <header class="topbar enter-header">
     <div class="wrap topbar-inner">
       <h1>Arquitetura Distribuída WebSocket</h1>
-      <a id="haproxy-link" class="header-link" href="http://localhost:8404" target="_blank" rel="noopener">
+      <a id="haproxy-link" class="header-link t-learn" href="http://localhost:8404" target="_blank" rel="noopener">
         HAProxy Stats :8404
+        <span class="t-learn-chevron" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path class="t-learn-arm t-learn-arm-top" d="M6 4L10 8" />
+            <path class="t-learn-arm t-learn-arm-bot" d="M10 8L6 12" />
+          </svg>
+        </span>
       </a>
     </div>
   </header>
@@ -25,7 +31,7 @@
           <div class="chat-title-row">
             <span id="live-ring" class="live-ring" aria-hidden="true"></span>
             <h2>Sala <code>room:main</code></h2>
-            <span id="conn-meta" class="meta-inline">Desconectado</span>
+            <span id="conn-meta" class="meta-inline t-text-swap">Desconectado</span>
           </div>
 
           <form id="connect-form" class="connect-controls">
@@ -44,7 +50,14 @@
           </form>
         </div>
 
-        <div id="sync-notice" class="sync-notice hidden" role="status"></div>
+        <div id="sync-notice" class="sync-notice hidden" role="status">
+          <span id="sync-check" class="t-success-check" data-state="out" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 13l4 4L19 7" />
+            </svg>
+          </span>
+          <span id="sync-notice-text"></span>
+        </div>
 
         <div id="chat-messages" class="chat-messages" aria-live="polite">
           <div class="empty-state">Entre com um nome acima para conectar na sala WebSocket.</div>

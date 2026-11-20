@@ -32,6 +32,8 @@ const state = {
   traceFlushTimers: new Map(),
   lastWebSocketTraceId: null,
   replaying: false,
+  connVisualMode: 'disconnected',
+  connSwapTimer: null,
 };
 
 const el = {
@@ -43,6 +45,8 @@ const el = {
   btnConnect: document.getElementById('btn-connect'),
   btnSwitchUser: document.getElementById('btn-switch-user'),
   syncNotice: document.getElementById('sync-notice'),
+  syncCheck: document.getElementById('sync-check'),
+  syncNoticeText: document.getElementById('sync-notice-text'),
   chatMessages: document.getElementById('chat-messages'),
   chatForm: document.getElementById('chat-form'),
   messageInput: document.getElementById('message-input'),
@@ -368,20 +372,69 @@ function addChatMessage(msg, recovered = false) {
   el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
 }
 
+function swapConnMetaText(mode, nextText, nextClass) {
+  if (state.connSwapTimer) {
+    clearTimeout(state.connSwapTimer);
+    state.connSwapTimer = null;
+  }
+
+  if (state.connVisualMode === mode) {
+    el.connMeta.textContent = nextText;
+    el.connMeta.className = nextClass;
+    return;
+  }
+
+  state.connVisualMode = mode;
+  const dur =
+    parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--text-swap-dur')
+    ) || 150;
+
+  el.connMeta.classList.add('is-exit');
+  state.connSwapTimer = setTimeout(() => {
+    state.connSwapTimer = null;
+    el.connMeta.textContent = nextText;
+    el.connMeta.className = `${nextClass} is-enter-start`;
+    void el.connMeta.offsetHeight;
+    el.connMeta.classList.remove('is-enter-start');
+  }, dur);
+}
+
 function updateMetaLine(connected) {
   if (connected) {
     el.liveRing.className = 'live-ring is-live';
-    el.connMeta.textContent = `${state.userId} · ${state.gatewayId} · #seq ${state.lastSeenSeqId}`;
-    el.connMeta.className = 'meta-inline is-online';
+    swapConnMetaText(
+      'online',
+      `${state.userId} · ${state.gatewayId} · #seq ${state.lastSeenSeqId}`,
+      'meta-inline t-text-swap is-online'
+    );
   } else if (state.canReconnect) {
     el.liveRing.className = 'live-ring is-saved';
-    el.connMeta.textContent = `Desconectado (${state.userId} · #seq ${state.lastSeenSeqId})`;
-    el.connMeta.className = 'meta-inline is-offline-saved';
+    swapConnMetaText(
+      'saved',
+      `Desconectado (${state.userId} · #seq ${state.lastSeenSeqId})`,
+      'meta-inline t-text-swap is-offline-saved'
+    );
   } else {
     el.liveRing.className = 'live-ring';
-    el.connMeta.textContent = 'Desconectado';
-    el.connMeta.className = 'meta-inline';
+    swapConnMetaText('disconnected', 'Desconectado', 'meta-inline t-text-swap');
   }
+}
+
+function showSyncNotice(text) {
+  el.syncNoticeText.textContent = text;
+  el.syncNotice.classList.remove('hidden');
+
+  const path = el.syncCheck.querySelector('svg path');
+  if (path) {
+    const len = Math.ceil(path.getTotalLength()) + 1;
+    path.style.strokeDasharray = String(len);
+    path.style.strokeDashoffset = String(len);
+  }
+
+  el.syncCheck.setAttribute('data-state', 'out');
+  void el.syncCheck.offsetWidth;
+  el.syncCheck.setAttribute('data-state', 'in');
 }
 
 function updateConnectionUi(connected) {
@@ -445,8 +498,7 @@ function openChatSocket(useLastSeq = false) {
         up_to_date: 'Nenhuma mensagem perdida',
       };
       const label = labels[msg.recoverySource] || msg.recoverySource;
-      el.syncNotice.textContent = `Reconexão: ${label} · ${msg.messages.length} msg(s) recuperada(s).`;
-      el.syncNotice.classList.remove('hidden');
+      showSyncNotice(`Reconexão: ${label} · ${msg.messages.length} msg(s) recuperada(s).`);
 
       for (const item of msg.messages || []) {
         addChatMessage(item, true);
