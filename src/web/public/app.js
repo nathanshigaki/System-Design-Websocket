@@ -106,12 +106,85 @@ const FLOW_COLORS = {
   reconnect: '#22c55e',
 };
 
-function colorForUser(name) {
+function hashString(name) {
   let hash = 0;
   for (let i = 0; i < name.length; i += 1) {
     hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
   }
-  return AVATAR_PALETTE[hash % AVATAR_PALETTE.length];
+  return hash;
+}
+
+function colorForUser(name) {
+  return AVATAR_PALETTE[hashString(name) % AVATAR_PALETTE.length];
+}
+
+function svgEl(tag, attrs = {}) {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    node.setAttribute(k, String(v));
+  }
+  return node;
+}
+
+function createAvatarSvg(name) {
+  const h = hashString(name);
+  const bg = AVATAR_PALETTE[h % AVATAR_PALETTE.length];
+  const skins = ['#f8d2b6', '#ecc19c', '#d79b6f', '#ad724c', '#f3c6a5'];
+  const hairs = ['#1e293b', '#3f2305', '#713f12', '#0f172a', '#9a3412'];
+  const shirts = ['#1e3a8a', '#115e59', '#92400e', '#9f1239', '#334155', '#166534'];
+
+  const skin = skins[(h >>> 3) % skins.length];
+  const hair = hairs[(h >>> 6) % hairs.length];
+  const shirt = shirts[(h >>> 9) % shirts.length];
+  const hairStyle = (h >>> 12) % 5;
+
+  const svg = svgEl('svg', { viewBox: '0 0 36 36', 'aria-hidden': 'true' });
+  svg.appendChild(svgEl('rect', { x: 0, y: 0, width: 36, height: 36, fill: bg }));
+
+  // Shoulders / shirt
+  svg.appendChild(svgEl('path', { d: 'M6 36c1-8 6-11 12-11s11 3 12 11z', fill: shirt }));
+  // Neck
+  svg.appendChild(svgEl('rect', { x: 15, y: 21, width: 6, height: 5, rx: 2, fill: skin }));
+
+  // Back hair for long/bob style
+  if (hairStyle === 3) {
+    svg.appendChild(svgEl('path', { d: 'M10 15c0-6 16-6 16 0v10H10z', fill: hair }));
+  }
+
+  // Head
+  svg.appendChild(svgEl('circle', { cx: 18, cy: 16, r: 7.5, fill: skin }));
+
+  // Eyes & smile
+  svg.appendChild(svgEl('circle', { cx: 15.3, cy: 15.8, r: 1, fill: '#0f172a' }));
+  svg.appendChild(svgEl('circle', { cx: 20.7, cy: 15.8, r: 1, fill: '#0f172a' }));
+  svg.appendChild(
+    svgEl('path', {
+      d: 'M15.4 18.8c1.5 1.3 3.7 1.3 5.2 0',
+      fill: 'none',
+      stroke: '#0f172a',
+      'stroke-width': 1.2,
+      'stroke-linecap': 'round',
+    })
+  );
+
+  // Hair / cap variants
+  if (hairStyle === 0) {
+    svg.appendChild(svgEl('path', { d: 'M10.5 14c0-5 3.5-7.5 7.5-7.5s7.5 2.5 7.5 7.5c-2-2.2-5-2.8-7.5-2.8s-5.5.6-7.5 2.8z', fill: hair }));
+  } else if (hairStyle === 1) {
+    svg.appendChild(svgEl('path', { d: 'M10.5 15c0-5.5 3.8-8.5 8.2-8.5 4.2 0 6.8 2.8 6.8 7-3-1.8-6.5-1.5-9.8.2-1.8.9-3.6 1.5-5.2 1.3z', fill: hair }));
+  } else if (hairStyle === 2) {
+    svg.appendChild(svgEl('circle', { cx: 13.5, cy: 10.5, r: 3.4, fill: hair }));
+    svg.appendChild(svgEl('circle', { cx: 18, cy: 9.2, r: 3.8, fill: hair }));
+    svg.appendChild(svgEl('circle', { cx: 22.5, cy: 10.5, r: 3.4, fill: hair }));
+  } else if (hairStyle === 3) {
+    svg.appendChild(svgEl('path', { d: 'M10.5 14.5c1-4.8 4-7 7.5-7s6.5 2.2 7.5 7c-2.2-2.4-4.8-3-7.5-3s-5.3.6-7.5 3z', fill: hair }));
+  } else {
+    // Cap
+    svg.appendChild(svgEl('path', { d: 'M10.2 13.5c0-4.5 3.5-7 7.8-7s7.8 2.5 7.8 7z', fill: shirt }));
+    svg.appendChild(svgEl('rect', { x: 9.5, y: 12.2, width: 17, height: 2.2, rx: 1.1, fill: '#e2e8f0' }));
+  }
+
+  return svg;
 }
 
 function flashNode(nodeId, flow, durationMs) {
@@ -328,8 +401,7 @@ function addChatMessage(msg, recovered = false) {
 
   const avatar = document.createElement('div');
   avatar.className = 'msg-avatar';
-  avatar.style.backgroundColor = colorForUser(msg.userId);
-  avatar.textContent = msg.userId.slice(0, 2).toUpperCase();
+  avatar.appendChild(createAvatarSvg(msg.userId));
 
   const contentWrap = document.createElement('div');
   contentWrap.className = 'msg-content-wrap';
@@ -673,8 +745,7 @@ function renderAvatarGroup(sessions) {
   for (const session of visible) {
     const item = document.createElement('div');
     item.className = 't-avatar';
-    item.style.backgroundColor = colorForUser(session.userId);
-    item.textContent = session.userId.slice(0, 2).toUpperCase();
+    item.appendChild(createAvatarSvg(session.userId));
     item.title = `${session.userId} (${session.gatewayId})`;
     el.roomAvatars.appendChild(item);
     avatarEls.push(item);
