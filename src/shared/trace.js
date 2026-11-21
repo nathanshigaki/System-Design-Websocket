@@ -14,6 +14,9 @@ export function createTraceEmitter(redisPub) {
     protocol,
     detail = '',
   }) {
+    if (redisPub.status && redisPub.status !== 'ready') {
+      return;
+    }
     try {
       const payload = JSON.stringify({
         type: 'trace_hop',
