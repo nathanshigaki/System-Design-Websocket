@@ -408,56 +408,8 @@ wss.on('connection', async (ws, req) => {
   ws.isAlive = true;
   localClients.add(clientEntry);
 
-  try {
-    await registerSession(userId, connectionId);
-    const [currentSeqId, epoch] = await Promise.all([
-      getAuthoritativeSeqId(),
-      getOrLoadRoomEpoch(redis, pgPool).catch(() => null),
-    ]);
-
-    sendJson(ws, {
-      type: 'welcome',
-      userId,
-      gatewayId: GATEWAY_ID,
-      currentSeqId,
-      epoch,
-    });
-
-    if (lastSeenSeqId !== null && lastSeenSeqId >= 0) {
-      await recoverMissedMessages(clientEntry, lastSeenSeqId, currentSeqId, epoch, clientEpoch);
-    } else {
-      let recent = (await readRingBufferAsc()).slice(-20);
-      if (recent.length === 0 && currentSeqId > 0) {
-        const fromSeq = Math.max(0, currentSeqId - 20);
-        const pgFallback = await readPostgresMessagesAfter(fromSeq, 20);
-        recent = pgFallback.messages;
-      }
-      if (recent.length > 0) {
-        clientEntry.lastSeqId = Math.max(
-          clientEntry.lastSeqId,
-          recent[recent.length - 1].seqId
-        );
-        sendJson(ws, {
-          type: 'history',
-          currentSeqId,
-          epoch,
-          messages: recent,
-        });
-      } else {
-        clientEntry.lastSeqId = currentSeqId;
-      }
-    }
-
-    await enqueueJob({
-      type: 'user_joined',
-      userId,
-      gatewayId: GATEWAY_ID,
-      receivedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error(`[${GATEWAY_ID}] connection setup error:`, err.message);
-  }
-
+  // Register socket event listeners synchronously before any async I/O so fast
+  // clients sending right after `welcome` never race with listener attachment.
   ws.on('pong', async () => {
     ws.isAlive = true;
     try {
@@ -623,6 +575,56 @@ wss.on('connection', async (ws, req) => {
   ws.on('error', (err) => {
     console.error(`[${GATEWAY_ID}] socket error (${userId}):`, err.message);
   });
+
+  try {
+    await registerSession(userId, connectionId);
+    const [currentSeqId, epoch] = await Promise.all([
+      getAuthoritativeSeqId(),
+      getOrLoadRoomEpoch(redis, pgPool).catch(() => null),
+    ]);
+
+    sendJson(ws, {
+      type: 'welcome',
+      userId,
+      gatewayId: GATEWAY_ID,
+      currentSeqId,
+      epoch,
+    });
+
+    if (lastSeenSeqId !== null && lastSeenSeqId >= 0) {
+      await recoverMissedMessages(clientEntry, lastSeenSeqId, currentSeqId, epoch, clientEpoch);
+    } else {
+      let recent = (await readRingBufferAsc()).slice(-20);
+      if (recent.length === 0 && currentSeqId > 0) {
+        const fromSeq = Math.max(0, currentSeqId - 20);
+        const pgFallback = await readPostgresMessagesAfter(fromSeq, 20);
+        recent = pgFallback.messages;
+      }
+      if (recent.length > 0) {
+        clientEntry.lastSeqId = Math.max(
+          clientEntry.lastSeqId,
+          recent[recent.length - 1].seqId
+        );
+        sendJson(ws, {
+          type: 'history',
+          currentSeqId,
+          epoch,
+          messages: recent,
+        });
+      } else {
+        clientEntry.lastSeqId = currentSeqId;
+      }
+    }
+
+    await enqueueJob({
+      type: 'user_joined',
+      userId,
+      gatewayId: GATEWAY_ID,
+      receivedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error(`[${GATEWAY_ID}] connection setup error:`, err.message);
+  }
 });
 
 let cmdConnectedOnce = false;
