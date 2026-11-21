@@ -264,16 +264,37 @@ async function testB1AndB2RedisRestart() {
       }
 
       // B2 edge case: Client reconnecting with divergent future lastSeenSeqId gets resetRequired=true
+      // Also exercises Page 9 SQL fallback pagination (sync_more) when DB has >200 messages
       const futureClient = await connectClient('b2-future', {
         lastSeenSeqId: seq4 + 9999,
         waitSync: true,
       });
       try {
-        const sync = futureClient.syncs[0];
-        assert.equal(sync.resetRequired, true, 'Divergent lastSeenSeqId must trigger resetRequired=true');
+        const firstSync = futureClient.syncs[0];
+        assert.equal(
+          firstSync.resetRequired,
+          true,
+          'Divergent lastSeenSeqId must trigger resetRequired=true'
+        );
+
+        const allRecovered = [...firstSync.messages];
+        let latestSync = firstSync;
+        while (latestSync.hasMore) {
+          const prevCount = futureClient.syncs.length;
+          const lastSeq = allRecovered[allRecovered.length - 1]?.seqId || 0;
+          futureClient.ws.send(JSON.stringify({ type: 'sync_more', afterSeqId: lastSeq }));
+          await waitForCondition(
+            () => futureClient.syncs.length > prevCount,
+            5000,
+            'next sync_more page'
+          );
+          latestSync = futureClient.syncs[futureClient.syncs.length - 1];
+          allRecovered.push(...latestSync.messages);
+        }
+
         assert.ok(
-          sync.messages.some((m) => m.content === `${tag}-4`),
-          'Reset sync must deliver current valid room messages'
+          allRecovered.some((m) => m.content === `${tag}-4`),
+          'Reset sync (+ pagination) must deliver current valid room messages'
         );
       } finally {
         await closeClients([futureClient]);
