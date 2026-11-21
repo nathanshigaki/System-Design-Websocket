@@ -22,8 +22,12 @@ const state = {
   traceWs: null,
   userId: '',
   gatewayId: '',
+  roomEpoch: null,
   lastSeenSeqId: 0,
   canReconnect: false,
+  manualDisconnect: false,
+  reconnectAttempts: 0,
+  reconnectTimer: null,
   seenSeqIds: new Set(),
   pollingEnabled: true,
   lastNotificationId: 0,
@@ -464,10 +468,60 @@ function updateConnectionUi(connected) {
   }
 }
 
+function generateClientMsgId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clearReconnectTimer() {
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+}
+
+function scheduleAutoReconnect() {
+  if (state.manualDisconnect || !state.userId) return;
+  clearReconnectTimer();
+
+  const attempt = state.reconnectAttempts;
+  const baseDelay = Math.min(300 * Math.pow(2, attempt), 5000);
+  const jitter = Math.floor(Math.random() * 150);
+  const delay = baseDelay + jitter;
+  state.reconnectAttempts += 1;
+
+  swapConnMetaText(
+    'reconnecting',
+    `Reconectando em ${(delay / 1000).toFixed(1)}s...`,
+    'meta-inline t-text-swap'
+  );
+
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
+    if (!state.manualDisconnect && state.userId && !state.ws) {
+      openChatSocket(true);
+    }
+  }, delay);
+}
+
+function resetLocalRoomHistory() {
+  state.seenSeqIds.clear();
+  state.lastSeenSeqId = 0;
+  el.chatMessages.innerHTML = '';
+}
+
 function openChatSocket(useLastSeq = false) {
+  clearReconnectTimer();
+  state.manualDisconnect = false;
+
   const params = new URLSearchParams({ userId: state.userId });
   if (useLastSeq) {
     params.set('lastSeenSeqId', String(state.lastSeenSeqId));
+    if (state.roomEpoch) {
+      params.set('epoch', state.roomEpoch);
+    }
   }
 
   const ws = new WebSocket(`${WS_URL}?${params.toString()}`);
@@ -479,6 +533,15 @@ function openChatSocket(useLastSeq = false) {
     if (msg.type === 'welcome') {
       state.gatewayId = msg.gatewayId;
       state.canReconnect = true;
+      state.reconnectAttempts = 0;
+
+      if (msg.epoch && state.roomEpoch && msg.epoch !== state.roomEpoch) {
+        resetLocalRoomHistory();
+      }
+      if (msg.epoch) {
+        state.roomEpoch = msg.epoch;
+      }
+
       if (!useLastSeq && msg.currentSeqId > state.lastSeenSeqId) {
         state.lastSeenSeqId = msg.currentSeqId;
       }
@@ -488,6 +551,7 @@ function openChatSocket(useLastSeq = false) {
     }
 
     if (msg.type === 'history') {
+      if (msg.epoch) state.roomEpoch = msg.epoch;
       for (const item of msg.messages || []) {
         addChatMessage(item, false);
       }
@@ -495,6 +559,13 @@ function openChatSocket(useLastSeq = false) {
     }
 
     if (msg.type === 'sync') {
+      if (msg.resetRequired) {
+        resetLocalRoomHistory();
+      }
+      if (msg.epoch) {
+        state.roomEpoch = msg.epoch;
+      }
+
       const labels = {
         ring_buffer: 'Ring Buffer Redis (0 queries no DB)',
         postgres_offline: 'Fallback PostgreSQL (offline longo)',
@@ -506,11 +577,22 @@ function openChatSocket(useLastSeq = false) {
       for (const item of msg.messages || []) {
         addChatMessage(item, true);
       }
+
+      if (msg.hasMore && state.ws && state.ws.readyState === WebSocket.OPEN) {
+        state.ws.send(
+          JSON.stringify({ type: 'sync_more', afterSeqId: state.lastSeenSeqId })
+        );
+      }
       return;
     }
 
     if (msg.type === 'room_message') {
       addChatMessage(msg, false);
+      return;
+    }
+
+    if (msg.type === 'error') {
+      addSystemLine(msg.message || 'Erro ao processar mensagem.');
     }
   };
 
@@ -519,6 +601,9 @@ function openChatSocket(useLastSeq = false) {
       state.ws = null;
       updateConnectionUi(false);
       refreshCluster();
+      if (!state.manualDisconnect && state.userId) {
+        scheduleAutoReconnect();
+      }
     }
   };
 }
@@ -526,6 +611,8 @@ function openChatSocket(useLastSeq = false) {
 el.connectForm.addEventListener('submit', (e) => {
   e.preventDefault();
   if (state.ws) {
+    state.manualDisconnect = true;
+    clearReconnectTimer();
     state.ws.close(1000, 'User disconnect');
     addSystemLine(`Desconectado mantendo #seq ${state.lastSeenSeqId}. Clique em Reconectar para testar o Ring Buffer.`);
     return;
@@ -539,19 +626,25 @@ el.connectForm.addEventListener('submit', (e) => {
   const name = el.usernameInput.value.trim();
   if (!name) return;
   state.userId = name;
+  state.roomEpoch = null;
   state.seenSeqIds.clear();
   state.lastSeenSeqId = 0;
   state.canReconnect = false;
+  state.reconnectAttempts = 0;
   el.syncNotice.classList.add('hidden');
   el.chatMessages.innerHTML = '';
   openChatSocket(false);
 });
 
 el.btnSwitchUser.addEventListener('click', () => {
+  state.manualDisconnect = true;
+  clearReconnectTimer();
   state.userId = '';
   state.gatewayId = '';
+  state.roomEpoch = null;
   state.lastSeenSeqId = 0;
   state.canReconnect = false;
+  state.reconnectAttempts = 0;
   state.seenSeqIds.clear();
   el.syncNotice.classList.add('hidden');
   el.chatMessages.innerHTML =
@@ -565,7 +658,13 @@ el.chatForm.addEventListener('submit', (e) => {
   const content = el.messageInput.value.trim();
   if (!content || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
 
-  state.ws.send(JSON.stringify({ type: 'chat_message', content }));
+  state.ws.send(
+    JSON.stringify({
+      type: 'chat_message',
+      content,
+      clientMsgId: generateClientMsgId(),
+    })
+  );
   el.messageInput.value = '';
   el.messageInput.focus();
 });

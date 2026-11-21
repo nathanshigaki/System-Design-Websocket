@@ -8,12 +8,19 @@ import { WebSocketServer, WebSocket } from 'ws';
 import Redis from 'ioredis';
 import pg from 'pg';
 import {
+  GW_ALIVE_PREFIX,
   RING_BUFFER_SIZE,
   RING_KEY,
   SEQ_KEY,
   SESSION_PREFIX,
   TRACE_CHANNEL,
 } from '../../shared/constants.js';
+import {
+  createPgPool,
+  createRedisClient,
+  installProcessErrorHandlers,
+  scanKeys,
+} from '../../shared/clients.js';
 import { createTraceEmitter } from '../../shared/trace.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -36,10 +43,22 @@ const MIME_TYPES = {
   '.jpg': 'image/jpeg',
 };
 
-const redis = new Redis(REDIS_URL);
-const redisSub = new Redis(REDIS_URL);
-const pgPool = new pg.Pool({ connectionString: DATABASE_URL });
+installProcessErrorHandlers('web');
+
+const redis = createRedisClient(Redis, REDIS_URL, 'web:cmd');
+const redisSub = createRedisClient(Redis, REDIS_URL, 'web:sub');
+const pgPool = createPgPool(pg, DATABASE_URL, 'web');
 const emitHop = createTraceEmitter(redis);
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label} timeout (${ms}ms)`)), ms);
+      timer.unref?.();
+    }),
+  ]);
+}
 
 function sendJson(res, statusCode, data) {
   res.writeHead(statusCode, {
@@ -54,7 +73,7 @@ async function handleNotifications(reqUrl, res) {
   const afterId = Number.isFinite(afterIdRaw) && afterIdRaw >= 0 ? afterIdRaw : 0;
   const traceId = randomUUID();
 
-  await emitHop({
+  void emitHop({
     traceId,
     flow: 'polling',
     step: 1,
@@ -64,7 +83,7 @@ async function handleNotifications(reqUrl, res) {
     detail: `Short Polling /api/notifications?afterId=${afterId}`,
   });
 
-  await emitHop({
+  void emitHop({
     traceId,
     flow: 'polling',
     step: 2,
@@ -95,7 +114,7 @@ async function handleNotifications(reqUrl, res) {
     notifications.length > 0 ? notifications[notifications.length - 1].id : afterId;
   const empty = notifications.length === 0;
 
-  await emitHop({
+  void emitHop({
     traceId,
     flow: 'polling',
     step: 3,
@@ -105,7 +124,7 @@ async function handleNotifications(reqUrl, res) {
     detail: empty ? '0 linhas' : `${notifications.length} notificacao(oes)`,
   });
 
-  await emitHop({
+  void emitHop({
     traceId,
     flow: 'polling',
     step: 4,
@@ -119,22 +138,64 @@ async function handleNotifications(reqUrl, res) {
 }
 
 async function handleClusterStatus(res) {
-  const keys = await redis.keys(`${SESSION_PREFIX}*`);
-  let sessions = [];
+  const [sessionKeys, aliveKeys] = await Promise.all([
+    scanKeys(redis, `${SESSION_PREFIX}*`),
+    scanKeys(redis, `${GW_ALIVE_PREFIX}*`),
+  ]);
 
-  if (keys.length > 0) {
-    const values = await redis.mget(keys);
-    sessions = values
-      .map((val) => {
-        if (!val) return null;
-        try {
-          return JSON.parse(val);
-        } catch {
-          return null;
+  // Build map of live gateways -> current bootId (B7)
+  const aliveByGateway = new Map();
+  if (aliveKeys.length > 0) {
+    const aliveValues = await redis.mget(aliveKeys);
+    for (let i = 0; i < aliveKeys.length; i++) {
+      const raw = aliveValues[i];
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed.gatewayId) {
+          aliveByGateway.set(parsed.gatewayId, parsed.bootId || null);
         }
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.userId.localeCompare(b.userId));
+      } catch {
+        const gwId = aliveKeys[i].slice(GW_ALIVE_PREFIX.length);
+        aliveByGateway.set(gwId, null);
+      }
+    }
+  }
+
+  let sessions = [];
+  const orphanedKeys = [];
+
+  if (sessionKeys.length > 0) {
+    const values = await redis.mget(sessionKeys);
+    for (let i = 0; i < sessionKeys.length; i++) {
+      const val = values[i];
+      if (!val) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(val);
+      } catch {
+        orphanedKeys.push(sessionKeys[i]);
+        continue;
+      }
+
+      const liveBootId = aliveByGateway.get(parsed.gatewayId);
+      const isGatewayAlive = aliveByGateway.has(parsed.gatewayId);
+      const bootMatches =
+        !parsed.bootId || !liveBootId || parsed.bootId === liveBootId;
+
+      if (!isGatewayAlive || !bootMatches) {
+        orphanedKeys.push(sessionKeys[i]);
+        continue;
+      }
+
+      sessions.push(parsed);
+    }
+
+    sessions.sort((a, b) => a.userId.localeCompare(b.userId));
+  }
+
+  if (orphanedKeys.length > 0) {
+    redis.del(...orphanedKeys).catch(() => {});
   }
 
   const summaryByGateway = { 'gateway-1': 0, 'gateway-2': 0 };
@@ -147,6 +208,7 @@ async function handleClusterStatus(res) {
   sendJson(res, 200, {
     sessions,
     summaryByGateway,
+    aliveGateways: Array.from(aliveByGateway.keys()).sort(),
     currentSeqId: Number(seqRaw || 0),
     ringBufferSize: Number(ringLen || 0),
     ringBufferCapacity: RING_BUFFER_SIZE,
@@ -191,7 +253,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && reqUrl.pathname === '/health') {
-      sendJson(res, 200, { status: 'ok' });
+      try {
+        await Promise.all([
+          withTimeout(redis.ping(), 800, 'redis ping'),
+          withTimeout(pgPool.query('SELECT 1'), 800, 'postgres ping'),
+        ]);
+        sendJson(res, 200, { status: 'ok' });
+      } catch (err) {
+        sendJson(res, 503, { status: 'degraded', error: err.message });
+      }
       return;
     }
 
