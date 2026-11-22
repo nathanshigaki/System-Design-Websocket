@@ -9,7 +9,9 @@ PREPARACAO ANTES DE COMECAR (NAO CONTA NOS 10 MIN):
   1) http://localhost:3000 (ou link do Cloudflare Tunnel para a turma)
   2) http://localhost:8404 (HAProxy Stats)
   3) Imagem docs/system-design-architecture.jpg na tela/slide
-- Terminal pronto com o comando: docker compose restart worker-1
+- Terminal pronto com os comandos: docker compose restart worker-1 e
+  docker compose kill -s SIGKILL gateway-1 (depois: docker compose up -d
+  gateway-1)
 
 ------------------------------------------------------------------------
 PESSOA 1 (0:00 a 2:00 | 2m00s)
@@ -94,7 +96,9 @@ usamos o 'Gateway Pattern':
 Segundo: como a Alice no Gateway 1 conversa com o Bob no Gateway 2?
 Usamos o Redis como ponte entre servidores:
 - Ele guarda o 'Session Manager' (quem esta em qual Gateway);
-- Recebe os comandos numa fila para o Worker processar;
+- Recebe os comandos numa fila duravel (Redis Streams): o Worker so
+  confirma a mensagem depois de grava-la no PostgreSQL, entao nada se
+  perde se ele cair;
 - E usa o Redis Pub/Sub (topico room:main) para avisar todos os Gateways
   ao mesmo tempo.
 (Vale citar um detalhe importante de grande volume: o Redis e
@@ -108,7 +112,9 @@ dos ultimos 5 segundos' direto no PostgreSQL, o banco cai (efeito
 Thundering Herd). Para evitar isso, o Worker da um 'seqId' crescente para
 cada mensagem e guarda as ultimas 50 num Ring Buffer na memoria do Redis.
 Na reconexao rapida, o Gateway pega tudo do Ring Buffer sem nem tocar no
-PostgreSQL — deixando o banco so para quem ficou offline por muito tempo."
+PostgreSQL — deixando o banco so para quem ficou offline por muito tempo.
+Alem disso, cada mensagem tem um identificador unico (clientMsgId), entao
+uma reentrega nunca duplica nada no banco."
 
 ------------------------------------------------------------------------
 PESSOA 4 (6:30 a 9:30 | 3m00s + 30s de folga para fechar em 10:00)
@@ -131,26 +137,34 @@ Tema: Demonstracao do Prototipo Funcional ao Vivo e Conclusao
    - E olhem aqui no Mapa Animado da Arquitetura — vou clicar em 'Replay
      em Camera Lenta': conseguimos ver o caminho real que essa mensagem
      fez: Cliente -> Proxy Web (:3000) -> HAProxy L4 (:8080) -> Gateway 1
-     -> Redis Fila -> Smart Worker -> PostgreSQL + Ring Buffer -> Redis
-     Pub/Sub -> voltando pelos dois Gateways ate todos os clientes!
+      -> Redis Streams -> Smart Worker -> PostgreSQL (gravacao idempotente)
+      + Ring Buffer -> Redis Pub/Sub -> voltando pelos dois Gateways ate
+      todos os clientes!
 
-3. Comparativo com Short Polling (0:35):
+3. Comparativo com Short Polling (0:25):
    - Aqui do lado temos um feed de notificacoes rodando com Short Polling
      (/api/notifications). Percebam o contador: mesmo sem ninguem falar
      nada, ele continua fazendo requisicoes HTTP vazias ('requisicoes
      fantasmas'), provando na pratica o que falamos no comeco.
 
-4. Tolerancia a Falhas ao Vivo (0:45):
+4. Tolerancia a Falhas ao Vivo (0:55):
    - Primeiro, clico em 'Simular Queda' no Bob, mando uma mensagem pela
      Alice e reconecto o Bob: ele recupera a mensagem automaticamente
      indicando que veio do Ring Buffer do Redis (zero consulta no banco!).
-   - Por ultimo, vou aqui no terminal e reinicio o Smart Worker:
+   - Depois, no terminal, reinicio o Smart Worker:
        docker compose restart worker-1
      Vejam que nenhum usuario desconectou da sala! Os Gateways seguraram
      os WebSockets normalmente enquanto o Worker reiniciava.
+   - Por ultimo, derrubo um Gateway a forca:
+       docker compose kill -s SIGKILL gateway-1
+     O navegador reconecta sozinho no gateway-2 em menos de 1 segundo, o
+     painel de sessoes remove quem estava no gateway caido e nenhuma
+     mensagem se perde. Esses cenarios (Redis, Worker, PostgreSQL e
+     Gateway) sao testados automaticamente por 'npm run test:fault'.
 
 Conclusao (0:10):
 Com isso provamos na pratica que escalar WebSockets exige balanceamento L4,
-Gateway Pattern, backplane Pub/Sub e Ring Buffer para proteger o banco.
+Gateway Pattern, fila duravel com gravacao idempotente, backplane Pub/Sub
+e Ring Buffer para proteger o banco.
 Muito obrigado, ficamos abertos a perguntas!"
 ========================================================================

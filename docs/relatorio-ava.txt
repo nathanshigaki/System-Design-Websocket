@@ -149,16 +149,23 @@ sistemas distribuidos em tempo real:
      ocorrem de forma transparente, sem desconectar nenhum cliente.
 
 4. Coordenacao Distribuida e Roteamento Cross-Server com Redis:
-   O Redis coordena o cluster por meio de quatro mecanismos em memoria:
+   O Redis coordena o cluster por meio de cinco mecanismos:
    - Distributed Session Manager: armazena o mapeamento dinamico
-     session:{userId} -> gatewayId com expiracao por TTL renovada via
-     heartbeat;
-   - Fila de Trabalho (jobs:messages): bufferiza comandos recebidos pelos
-     Gateways ate serem processados pelo Smart Worker;
+     session:{userId} -> gatewayId com expiracao por TTL (45 s) renovada
+     via heartbeat, alem da chave de vida do proprio Gateway
+     (gw:alive:{gatewayId}, TTL de 6 s renovado a cada 2 s) usada para
+     descartar sessoes de gateways que cairam;
+   - Fila de Trabalho duravel (Redis Streams, stream:jobs): os Gateways
+     publicam comandos com XADD e o Smart Worker os consome em um
+     consumer group (XREADGROUP), confirmando com XACK somente apos
+     persistir a mensagem. Entregas pendentes de um worker que morreu
+     sao recuperadas com XAUTOCLAIM (semantica at-least-once);
    - Pub/Sub Backplane (room:main): replica cada mensagem processada para
      todos os Gateways conectados entregarem a seus clientes locais;
    - Trace Stream (trace:events): canal de observabilidade que registra
-     os saltos reais percorridos por cada evento.
+     os saltos reais percorridos por cada evento;
+   - Persistencia AOF (appendonly yes, volume redisdata): o estado do
+     Redis, inclusive o contador seq:room:main, sobrevive a reinicios.
 
 5. Protecao contra Thundering Herd (Sequence ID + Ring Buffer):
    O Smart Worker atribui a cada mensagem um Sequence ID (seqId)
@@ -167,7 +174,35 @@ sistemas distribuidos em tempo real:
    envia seu lastSeenSeqId na reconexao e o Gateway executa o replay
    diretamente do Ring Buffer em memoria (zero consultas ao banco
    relacional). Somente desconexoes longas fora da janela em memoria
-   recorrem ao banco PostgreSQL.
+   recorrem ao banco PostgreSQL, em paginas de ate 200 mensagens
+   (hasMore / sync_more). Cada sala possui ainda um "epoch" (tabela
+   room_meta): se o cliente reconectar com um estado que nao pertence
+   mais a sala, o Gateway envia resetRequired e o cliente descarta o
+   historico local.
+
+6. Tolerancia a Falhas e Entrega Confiavel (Fault Tolerance):
+   Alem da separacao Gateway/Worker, o prototipo trata os modos de falha
+   identificados nos testes de injecao de falhas (Secao 5.2):
+   - Idempotencia ponta a ponta: o cliente gera um clientMsgId por
+     mensagem e o Worker grava com client_msg_id UNIQUE (ON CONFLICT DO
+     NOTHING), permitindo reentregas sem duplicar mensagens;
+   - Ordem segura de escrita no Worker: PostgreSQL primeiro, depois Ring
+     Buffer, depois PUBLISH e, por ultimo, XACK. Assim nao existe
+     mensagem "fantasma" no Ring Buffer sem registro no banco;
+   - Sincronizacao do seqId: ao iniciar (e quando a chave some do Redis)
+     o Worker alinha seq:room:main com MAX(seq_id) do PostgreSQL;
+   - Shutdown gracioso: no SIGTERM o Worker aguarda o job em andamento
+     terminar antes de fechar as conexoes;
+   - Resiliencia a quedas de infraestrutura: clientes Redis/PostgreSQL
+     com listeners de erro e reconexao automatica, politica
+     restart: unless-stopped em todos os containers e health check real
+     (Redis + PostgreSQL) nos Gateways e no servico web;
+   - Failover rapido no L4: HAProxy com health check HTTP em /health
+     (1 s), retries 3 e option redispatch; o navegador reconecta sozinho
+     com backoff exponencial e jitter enviando o lastSeenSeqId;
+   - Protecao contra abuso: WebSocket com maxPayload de 4 KB, validacao
+     do conteudo (1 a 500 caracteres) e rate limit por conexao antes de
+     enfileirar qualquer dado no Redis.
 
 
 4. ARQUITETURA DA SOLUCAO
@@ -197,52 +232,75 @@ b) Servidor Web & Proxy (web - Node.js 24, porta 3000):
    garantindo compatibilidade com HTTPS/WSS de mesma origem.
 
 c) HAProxy Load Balancer L4 (haproxy - HAProxy 2.9, portas 8080 e 8404):
-   Balanceador de Camada 4 configurado com mode tcp, balance leastconn e
-   verificacao ativa de saude (tcp-check) para gateway-1 e gateway-2. A
-   porta 8404 expoe o painel nativo de estatisticas do HAProxy para
-   inspecao em tempo real da distribuicao de conexoes.
+   Balanceador de Camada 4 configurado com mode tcp e balance leastconn.
+   A verificacao de saude e um health check HTTP (GET /health a cada 1 s,
+   esperando status 200) que valida Redis e PostgreSQL em cada Gateway,
+   combinado com retries 3 e option redispatch para reencaminhar
+   conexoes novas quando um Gateway cai. A porta 8404 expoe o painel
+   nativo de estatisticas do HAProxy para inspecao em tempo real da
+   distribuicao de conexoes.
 
 d) Dumb Gateways (gateway-1 na porta 4001 e gateway-2 na porta 4002):
    Duas instancias identicas em Node.js com a biblioteca ws. Aceitam
    conexoes WebSocket, registram sessoes no Redis com TTL de 45 segundos
-   (renovado por ping/pong), assinam room:main no Redis Pub/Sub para
-   entrega aos sockets locais e executam o protocolo de sincronizacao
-   (lastSeenSeqId) priorizando o Ring Buffer antes do fallback no banco.
+   (recriadas a cada ping/pong, o que recupera sessoes perdidas apos um
+   reinicio do Redis), publicam a chave de vida gw:alive:{gatewayId},
+   assinam room:main no Redis Pub/Sub para entrega aos sockets locais
+   (e se ressincronizam ao reconectar o Pub/Sub) e executam o protocolo
+   de sincronizacao (lastSeenSeqId e epoch) priorizando o Ring Buffer
+   antes do fallback paginado no banco. Continuam sem regra de negocio,
+   mas protegem a entrada: maxPayload de 4 KB, validacao do tamanho do
+   conteudo, rate limit por conexao e enfileiramento via XADD. Expoem
+   GET /health, que valida Redis e PostgreSQL.
 
 e) Redis 7 (redis - porta 6379):
    Atua como espinha dorsal em memoria do sistema distribuido:
    - Session Manager: chaves session:{userId} indicando o Gateway dono
      do socket;
-   - Sequence Generator: contador atomico seq:room:main via comando INCR;
+   - Sequence Generator: contador atomico seq:room:main via comando INCR
+     (realinhado com o PostgreSQL pelo Worker quando necessario);
    - Ring Buffer: lista limitada ring:room:main (LPUSH/LTRIM com 50
      mensagens recentes);
-   - Fila jobs:messages (RPUSH/BLPOP) e canais Pub/Sub (room:main e
-     trace:events).
+   - Fila duravel stream:jobs (Redis Streams: XADD, consumer group
+     workers-group, XREADGROUP, XACK e XAUTOCLAIM) e canais Pub/Sub
+     (room:main e trace:events);
+   - Chaves de apoio: gw:alive:{gatewayId} (liveness dos Gateways) e
+     room:main:epoch (identificador da sala);
+   - Persistencia AOF (appendonly yes, appendfsync everysec) em volume
+     Docker dedicado (redisdata).
 
 f) Smart Worker (worker-1 - Node.js 24):
-   Servico sem portas publicas que consome jobs:messages via BLPOP.
-   Centraliza validacao, geracao de seqId, atualizacao do Ring Buffer,
-   gravacao duravel no PostgreSQL (Single-Writer) e publicacao no canal
-   room:main. Por ser desacoplado dos sockets, pode ser escalado ou
-   reiniciado sem causar quedas nos clientes.
+   Servico sem portas publicas que consome stream:jobs via XREADGROUP.
+   Centraliza validacao, geracao de seqId, gravacao duravel e idempotente
+   no PostgreSQL (Single-Writer, chave client_msg_id), atualizacao do
+   Ring Buffer, publicacao no canal room:main e, so entao, XACK do job.
+   No boot recupera jobs pendentes e usa XAUTOCLAIM para assumir jobs de
+   workers que morreram. No SIGTERM aguarda o job em andamento terminar.
+   Por ser desacoplado dos sockets, pode ser escalado ou reiniciado sem
+   causar quedas nos clientes.
 
 g) PostgreSQL 16 (postgres - porta 5432):
    Banco relacional responsavel pela persistencia duravel nas tabelas
-   messages (historico completo ordenado por seq_id) e notifications
-   (eventos consultados pelo endpoint de Short Polling). Atende tambem ao
-   fallback controlado de clientes que ficaram offline alem da janela
+   messages (historico completo ordenado por seq_id, com client_msg_id
+   UNIQUE para idempotencia), notifications (eventos consultados pelo
+   endpoint de Short Polling) e room_meta (epoch da sala). Atende tambem
+   ao fallback paginado de clientes que ficaram offline alem da janela
    coberta pelo Ring Buffer.
 
 4.2 Descricao das Rotas do Sistema
 - Rota WebSocket (Ida e Volta): Cliente -> Web Proxy (:3000/ws) ->
-  HAProxy L4 (:8080) -> Gateway atribuido -> Redis (jobs:messages) ->
-  Smart Worker -> PostgreSQL + Redis (seqId/Ring Buffer) -> Redis Pub/Sub
-  (room:main) -> Gateway 1 e Gateway 2 -> Todos os Clientes conectados.
+  HAProxy L4 (:8080) -> Gateway atribuido -> Redis (stream:jobs, XADD) ->
+  Smart Worker (XREADGROUP) -> PostgreSQL (INSERT idempotente) -> Redis
+  (Ring Buffer) -> Redis Pub/Sub (room:main) -> XACK -> Gateway 1 e
+  Gateway 2 -> Todos os Clientes conectados.
 - Rota Short Polling: Cliente -> Web (:3000/api/notifications) ->
   PostgreSQL (SELECT) -> Cliente.
-- Rota de Reconexao: Cliente (enviando lastSeenSeqId) -> Web Proxy ->
-  HAProxy L4 -> Gateway -> Ring Buffer do Redis (recuperacao rapida em
-  RAM) ou Fallback PostgreSQL (offline longo) -> Cliente.
+- Rota de Reconexao: Cliente (enviando lastSeenSeqId e epoch) -> Web
+  Proxy -> HAProxy L4 -> Gateway -> Ring Buffer do Redis (recuperacao
+  rapida em RAM) ou Fallback PostgreSQL paginado (offline longo) ->
+  Cliente. Se o epoch divergir, o Gateway responde resetRequired. Quando
+  o Gateway cai, o navegador dispara a reconexao automaticamente
+  (backoff exponencial com jitter).
 
 4.3 Limites em Escala Extrema e Evolucao Arquitetural
 Para cenarios produtivos na escala de milhoes de usuarios simultaneos e
@@ -259,9 +317,6 @@ literatura tecnica destaca duas evolucoes naturais desta arquitetura:
 
 5. PROTOTIPO DA SOLUCAO (DESCRICAO DO QUE FOI FEITO)
 ------------------------------------------------------------------------
-[NOTA DE REVISAO: Secao a ser finalizada com as evidencias e metricas
-reais apos a implementacao e execucao dos containers Docker.]
-
 O prototipo pratico contempla a implementacao completa dos sete nos
 descritos na Secao 4 por meio de Docker Compose (docker-compose.yml,
 haproxy/haproxy.cfg, db/init.sql e servicos Node.js em src/):
@@ -278,17 +333,80 @@ haproxy/haproxy.cfg, db/init.sql e servicos Node.js em src/):
 - Mapa Visual Animado das Rotas (SVG Interativo): conectado ao stream
   /ws-trace, exibe graficamente o trajeto real de ida e volta das
   mensagens entre servidores, com suporte ao modo "Replay em Camera
-  Lenta" para inspecao passo a passo durante a apresentacao.
-- Validacao de Tolerancia a Falhas: simulacao de queda e reconexao no
-  navegador comprovando o replay pelo Ring Buffer sem consultas ao
-  PostgreSQL, reinicio do container worker-1 sem derrubar conexoes
-  WebSocket ativas e script automatizado (scripts/load-test.mjs) para
-  verificacao de carga e entrega cross-gateway.
+  Lenta" para inspecao passo a passo durante a apresentacao. A interface
+  foi redesenhada (tema escuro tecnico, icones por servidor, avatares
+  interativos dos usuarios conectados e micro-animacoes de transicao).
+- Reconexao automatica: se o Gateway cair, o navegador reconecta sozinho
+  (backoff exponencial com jitter), reenvia o lastSeenSeqId e recupera as
+  mensagens perdidas pelo Ring Buffer ou pelo PostgreSQL.
 
-[ESPACO RESERVADO PARA EVIDENCIAS POS-EXECUCAO:
- - Saida do comando docker compose ps;
- - Resultado da execucao dos testes automatizados (npm test);
- - Capturas de tela do chat, mapa animado das rotas e HAProxy Stats.]
+5.1 Validacao Funcional (npm test)
+O script scripts/load-test.mjs verifica, contra o ambiente em execucao:
+distribuicao L4 entre os Gateways (3 clientes em cada um), broadcast
+cross-gateway com o mesmo seqId, replay via Ring Buffer sem consultar o
+PostgreSQL, endpoint de Short Polling e saltos reais em /ws-trace. Ultimo
+resultado: "PASS: Todos os testes do sistema distribuido passaram com
+sucesso!" (55 saltos reais capturados em /ws-trace).
+
+5.2 Testes de Injecao de Falhas (npm run test:fault)
+Um relatorio tecnico de testes de falha sobre a primeira versao do
+prototipo (branch main) identificou oito cenarios (B1 a B8) em que o
+sistema perdia mensagens, derrubava servicos ou aceitava entradas
+abusivas. Todos foram corrigidos na branch fix/resilience-fault-tolerance
+e sao verificados automaticamente por scripts/fault-test.mjs, que usa
+docker compose para reiniciar ou matar (SIGKILL) os containers:
+
+ID  Falha injetada               Antes (versao inicial)         Depois (versao corrigida)
+--  ---------------------------  -----------------------------  ------------------------------------
+B1  Reinicio do Redis            seqId voltava a 1, erro        seqId continuo (ex.: 323 -> 326), 4/4
+                                 messages_seq_id_key e          mensagens no PostgreSQL, historico
+                                 mensagens fantasmas no Ring    identico entre usuarios, sessao
+                                 Buffer                         mantida
+B2  Reconexao com estado         Gateway respondia up_to_date   Cliente recebe todas as mensagens
+    antigo/divergente            e o cliente descartava         novas; estado divergente gera
+                                 mensagens repetidas            resetRequired + paginacao sync_more
+B3  SIGTERM no worker-1          Job em andamento era perdido   5/5 mensagens entregues e gravadas
+                                 (conexao fechada)              (shutdown aguarda o job)
+B4  kill -9 no worker-1 durante  1 de 300 mensagens perdida     300/300 preservadas, 0 perdidas e 0
+    rajada de 300 mensagens      (BLPOP e at-most-once)         duplicadas (Streams + XAUTOCLAIM +
+                                                                client_msg_id)
+B5  Reinicio do PostgreSQL       worker-1 e web caiam e nao     worker-1 e web mantiveram o mesmo PID
+                                 voltavam                       e o chat continuou operando
+B6  kill -9 no gateway-1         ~6,5 s para reconectar, 1a     reconexao via gateway-2 em 409 ms
+                                 tentativa com "socket hang     (730 ms desde o SIGKILL), automatica
+                                 up", front nao reconectava     no navegador
+B7  Gateway morto (sessoes)      Sessoes fantasmas por ate      Sessao fantasma removida de
+                                 45 s em /api/cluster           /api/cluster em ~6 s (gw:alive)
+B8  Payload de 5 MB e flood      5 MB entrava no Redis (pico    Conexao fechada com codigo 1009; delta
+                                 de ~19 MB), sem rate limit     de RAM no Redis de 0,00 MB; mensagens
+                                                                acima de 500 caracteres e flood
+                                                                recusados (INVALID_PAYLOAD,
+                                                                RATE_LIMITED)
+
+Tambem foram tratados os pontos adicionais do relatorio: substituicao do
+comando KEYS por SCAN no /api/cluster, ressincronizacao dos Gateways ao
+reconectar o Redis Pub/Sub, fallback SQL paginado (antes limitado a 200
+mensagens) e validacao do formato do userId. A autenticacao do userId
+permanece simplificada de forma intencional, pois a demonstracao em sala
+e feita por QR Code sem login.
+
+Ultimo resultado da suite: "ALL FAULT-INJECTION CHECKS (B1-B8 +
+REGRESSION) PASSED!", incluindo o cenario de regressao com o Redis
+parado temporariamente enquanto um cliente envia mensagem.
+
+5.3 Como Reproduzir
+  docker compose up -d --build     (sobe os 7 servicos)
+  docker compose ps                (confere a saude dos containers)
+  npm test                         (validacao funcional)
+  npm run test:fault               (injecao de falhas B1 a B8)
+Interface: http://localhost:3000 | HAProxy Stats: http://localhost:8404
+
+[INSERIR PRINTS AQUI APOS A EXECUCAO:
+  - Saida do comando docker compose ps (7 containers em execucao);
+  - Chat com usuarios em gateway-1 e gateway-2, mapa animado das rotas e
+    painel de Sessoes no Cluster;
+  - HAProxy Stats (:8404) com os dois Gateways em verde;
+  - Terminal com o resultado de npm test e npm run test:fault.]
 
 
 6. CONCLUSAO
@@ -307,4 +425,11 @@ A validacao pratica por meio da arquitetura conteinerizada, da comparacao
 direta com Short Polling e da visualizacao em tempo real do fluxo entre
 servidores consolida de forma objetiva os conceitos de comunicacao,
 escalabilidade horizontal e tolerancia a falhas da disciplina.
+
+Alem disso, os testes de injecao de falhas mostraram que a separacao
+Gateway/Worker nao basta sozinha: foi necessario tornar a fila duravel
+(Redis Streams), gravar de forma idempotente no banco antes de publicar,
+persistir o estado do Redis e proteger a borda contra payloads abusivos.
+Com essas correcoes, o prototipo passou a resistir a reinicios de Redis,
+PostgreSQL e Worker e a queda abrupta de um Gateway sem perder mensagens.
 ========================================================================

@@ -15,6 +15,22 @@ Implementar um **protótipo funcional de Sistema Distribuído** orquestrado com 
 
 *(Relatório do AVA e roteiro cronometrado de 10 minutos serão produzidos em etapa posterior.)*
 
+### Atualização — Resiliência e Tolerância a Falhas (branch `fix/resilience-fault-tolerance`)
+
+Após testes de injeção de falhas (`B1`–`B8`) sobre a primeira versão, a arquitetura foi endurecida. Os pontos abaixo já estão refletidos nas seções seguintes e são verificados por `npm run test:fault`:
+
+| ID | Falha injetada | Correção aplicada |
+| :--- | :--- | :--- |
+| `B1` | Reinício do Redis zerava `seq:room:main` e causava `messages_seq_id_key` | Redis com **AOF** (`redisdata`); Worker realinha `seq:room:main` com `MAX(seq_id)` do PostgreSQL; ordem **PostgreSQL → Ring Buffer → `PUBLISH` → `XACK`** |
+| `B2` | Reconexão com `lastSeenSeqId` divergente retornava `up_to_date` | `epoch` da sala (`room_meta`), `resetRequired` e paginação `sync_more`; sessão recriada via `SET ... EX` no `pong` |
+| `B3` | `SIGTERM` no Worker perdia o job em andamento | Shutdown gracioso aguarda o job atual (`inFlightJobPromise`) |
+| `B4` | `kill -9` no Worker perdia mensagens (`BLPOP` *at-most-once*) | **Redis Streams** (`XADD`/`XREADGROUP`/`XACK`/`XAUTOCLAIM`) + `client_msg_id UNIQUE` (idempotência) |
+| `B5` | Reinício do PostgreSQL derrubava `worker-1` e `web` | Listeners `error` em `pg.Pool`/Redis, `unhandledRejection` tratado e `restart: unless-stopped` |
+| `B6` | `kill -9` no Gateway levava ~6,5 s e o front não reconectava | HAProxy com health check HTTP `/health`, `retries 3`, `option redispatch`; reconexão automática no front (backoff + jitter) |
+| `B7` | Sessões fantasmas por até 45 s | Liveness `gw:alive:{gatewayId}` (TTL 6 s); `/api/cluster` filtra e limpa sessões órfãs |
+| `B8` | Payload de 5 MB entrava no Redis, sem rate limit | `maxPayload` de 4 KB, validação (1–500 caracteres) e rate limit por conexão no Gateway |
+| Extras | `KEYS session:*`, Pub/Sub sem ressincronização, SQL limitado a 200 | `SCAN`, resync ao reconectar o `redisSub`, fallback SQL paginado, validação de `userId` |
+
 ---
 
 ## Arquitetura da Solução e System Design
@@ -33,7 +49,7 @@ flowchart TB
 
     subgraph edge["Camada Edge e Balanceamento L4"]
         WEB["Web Server + WS Edge Proxy (Node.js 24 :3000)"]
-        LB["HAProxy Load Balancer Layer 4 (mode tcp, leastconn :8080 / Stats :8404)"]
+        LB["HAProxy Load Balancer Layer 4 (mode tcp, leastconn :8080 / Stats :8404, health check HTTP /health, retries 3 + redispatch)"]
         CF -->|"HTTP/WS (:3000)"| WEB
         BRW -->|"Local HTTP/WS (:3000)"| WEB
         WEB -->|"/ws (1 socket TCP por cliente)"| LB
@@ -47,7 +63,7 @@ flowchart TB
     end
 
     subgraph backplane["Backplane Distribuido (Redis 7)"]
-        RDS["Redis (Session Manager + Pub/Sub + Sequence ID + Ring Buffer + Fila :6380/6379)"]
+        RDS["Redis 7 AOF (Session Manager + gw:alive + Pub/Sub + Sequence ID + Ring Buffer + Redis Streams :6379)"]
         GW1 <-->|"Pub/Sub + Session + Ring Buffer"| RDS
         GW2 <-->|"Pub/Sub + Session + Ring Buffer"| RDS
         WEB <-->|"Cluster Status + Trace Stream"| RDS
@@ -56,9 +72,9 @@ flowchart TB
     subgraph processing["Camada de Negocio e Persistencia (Single-Writer)"]
         WK["Smart Worker (Node.js 24 - Regra de Negocio + seqId)"]
         PG["PostgreSQL 16 (Mensagens + Notificacoes Offline :5432)"]
-        RDS -->|"BLPOP jobs:messages"| WK
-        WK -->|"INCR seq + LPUSH Ring + PUBLISH"| RDS
-        WK -->|"INSERT messages / notifications"| PG
+        RDS -->|"XREADGROUP stream:jobs (XACK / XAUTOCLAIM)"| WK
+        WK -->|"INCR seq + LPUSH Ring + PUBLISH + XACK"| RDS
+        WK -->|"INSERT idempotente messages (client_msg_id) / notifications"| PG
         WEB -->|"SELECT /api/notifications (Short Polling)"| PG
         GW1 -.->|"SELECT Fallback Offline Longo"| PG
         GW2 -.->|"SELECT Fallback Offline Longo"| PG
@@ -90,11 +106,12 @@ sequenceDiagram
 
     Note over C1,C2: Rota 2 - Envio e Broadcast na Sala WebSocket (Ida e Volta)
     C1->>GW1: "WS frame: chat_message"
-    GW1->>RDS: "RPUSH jobs:messages"
-    WK->>RDS: "BLPOP jobs:messages"
-    WK->>RDS: "INCR seq:room:main -> LPUSH/LTRIM ring:room:main"
-    WK->>PG: "INSERT INTO messages & notifications"
-    WK->>RDS: "PUBLISH room:main (payload + seqId)"
+    GW1->>RDS: "XADD stream:jobs (clientMsgId)"
+    WK->>RDS: "XREADGROUP stream:jobs"
+    WK->>RDS: "INCR seq:room:main"
+    WK->>PG: "INSERT INTO messages (ON CONFLICT client_msg_id DO NOTHING)"
+    WK->>RDS: "LPUSH/LTRIM ring:room:main (somente apos o INSERT)"
+    WK->>RDS: "PUBLISH room:main (payload + seqId) e XACK"
     RDS-->>GW1: "Pub/Sub entrega para Gateway 1"
     RDS-->>GW2: "Pub/Sub entrega para Gateway 2"
     GW1-->>C1: "WS push (seqId)"
@@ -107,11 +124,11 @@ sequenceDiagram
 
     Note over C2,PG: Rota 4 - Queda e Reconexao (Ring Buffer vs PostgreSQL)
     C2->>GW2: "Reconecta com ?lastSeenSeqId=12"
-    GW2->>RDS: "LRANGE ring:room:main (busca seqId > 12)"
+    GW2->>RDS: "LRANGE ring:room:main (busca seqId > 12; confere epoch)"
     alt "Dentro da janela do Ring Buffer (ultimas 50)"
         GW2-->>C2: "sync (source=ring_buffer, zero query no DB)"
     else "Offline longo (fora do Ring Buffer)"
-        GW2->>PG: "SELECT seq_id > 12 FROM messages"
+        GW2->>PG: "SELECT seq_id > 12 FROM messages (paginado, hasMore / sync_more)"
         GW2-->>C2: "sync (source=postgres_offline)"
     end
 ```
@@ -123,12 +140,12 @@ sequenceDiagram
 | Servidor / Container | Imagem / Tecnologia | Porta | Protocolo | Papel na Arquitetura (Vídeos 1 e 2) |
 | :--- | :--- | :--- | :--- | :--- |
 | **`web`** | `node:24-alpine` (`node:http`, `ws`, `ioredis`, `pg`, HTML/CSS/JS + SVG) | `3000` | HTTP / WS Upgrade | Serve a UI animada, faz proxy de `/ws` para o HAProxy L4 (suporte a URL única + Cloudflare Tunnel), expõe `/ws-trace` e `/api/notifications`. |
-| **`haproxy`** | `haproxy:2.9-alpine` | `8080` / `8404` | TCP L4 / HTTP Stats | **Load Balancer Layer 4 (`mode tcp`, `balance leastconn`)**. Roteia conexões brutas sem quebrar túneis WebSocket nem aplicar timeouts curtos de HTTP L7. |
-| **`gateway-1`** | `node:24-alpine` (`ws`, `ioredis`, `pg`) | `4001` | WebSocket / TCP | **Dumb Gateway 1**. Mantém conexões WS, heartbeat/TTL no Session Manager e assina `room:main` no Redis. Zero regra de negócio. |
+| **`haproxy`** | `haproxy:2.9-alpine` | `8080` / `8404` | TCP L4 / HTTP Stats | **Load Balancer Layer 4 (`mode tcp`, `balance leastconn`)**. Roteia conexões brutas sem quebrar túneis WebSocket nem aplicar timeouts curtos de HTTP L7. Health check HTTP `GET /health` (1 s), `retries 3` e `option redispatch` para failover rápido. |
+| **`gateway-1`** | `node:24-alpine` (`ws`, `ioredis`, `pg`) | `4001` | WebSocket / TCP | **Dumb Gateway 1**. Mantém conexões WS, heartbeat/TTL no Session Manager, publica `gw:alive:*`, assina `room:main`, enfileira com `XADD` e protege a borda (`maxPayload` 4 KB, rate limit, `/health` real). Zero regra de negócio. |
 | **`gateway-2`** | `node:24-alpine` (`ws`, `ioredis`, `pg`) | `4002` | WebSocket / TCP | **Dumb Gateway 2**. Réplica idêntica para demonstrar escalabilidade horizontal, entrega cross-server e failover. |
-| **`worker-1`** | `node:24-alpine` (`ioredis`, `pg`) | interna | Redis Queue / SQL | **Smart Worker**. Processa regras da sala, gera `seqId`, atualiza Ring Buffer e grava no PostgreSQL. Pode ser reiniciado sem derrubar sockets nos Gateways. |
-| **`redis`** | `redis:7-alpine` | `6379` | RESP (TCP) | **Session Manager** (`session:*`), **Pub/Sub** (`room:main`, `trace:events`), **Sequence ID** (`seq:room:main`), **Ring Buffer** (`ring:room:main`) e **Fila** (`jobs:messages`). |
-| **`postgres`** | `postgres:16-alpine` | `5432` | TCP / SQL | Persistência durável de mensagens (`messages`) e notificações (`notifications`), usada no Short Polling e fallback de offline longo. |
+| **`worker-1`** | `node:24-alpine` (`ioredis`, `pg`) | interna | Redis Streams / SQL | **Smart Worker**. Consome `stream:jobs` (consumer group), gera `seqId`, grava no PostgreSQL de forma idempotente, atualiza o Ring Buffer, publica e confirma com `XACK`. Shutdown gracioso; pode ser reiniciado sem derrubar sockets nos Gateways. |
+| **`redis`** | `redis:7-alpine` | `6379` | RESP (TCP) | **Session Manager** (`session:*`), **Pub/Sub** (`room:main`, `trace:events`), **Sequence ID** (`seq:room:main`), **Ring Buffer** (`ring:room:main`), **Fila durável** (Redis Streams `stream:jobs`), liveness (`gw:alive:*`) e `room:main:epoch`. Persistência **AOF** no volume `redisdata`. |
+| **`postgres`** | `postgres:16-alpine` | `5432` | TCP / SQL | Persistência durável de mensagens (`messages`, com `client_msg_id UNIQUE`), notificações (`notifications`) e `room_meta` (`epoch`), usada no Short Polling e fallback paginado de offline longo. |
 
 ---
 
@@ -137,12 +154,12 @@ sequenceDiagram
 | Rota / Canal | Origem -> Destino | Método / Tipo | Descrição |
 | :--- | :--- | :--- | :--- |
 | `GET /` | Cliente -> `web` | HTTP | Entrega a interface web (Chat + Mapa Animado + Polling + Cluster). |
-| `UPGRADE /ws` | Cliente -> `web` -> `haproxy:8080` | WebSocket (`ws://` / `wss://`) | Conexão da sala única (`?userId=...&lastSeenSeqId=...`). Cada cliente abre um socket TCP independente no L4. |
+| `UPGRADE /ws` | Cliente -> `web` -> `haproxy:8080` | WebSocket (`ws://` / `wss://`) | Conexão da sala única (`?userId=...&lastSeenSeqId=...&epoch=...`). Cada cliente abre um socket TCP independente no L4. |
 | `UPGRADE /ws-trace` | Cliente -> `web` | WebSocket | Stream exclusivo de telemetria (`trace_hop`) para animar as rotas das mensagens no SVG em tempo real. |
 | `GET /api/notifications?afterId=N` | Cliente -> `web` -> `postgres` | HTTP (Short Polling) | Busca notificações mais recentes que `N`; retorna vazio quando não há novidade (contabiliza requisições "fantasmas"). |
-| `GET /api/cluster` | Cliente -> `web` -> `redis` | HTTP JSON | Retorna sessões ativas por Gateway (`gateway-1` vs `gateway-2`), `seqId` atual e tamanho do Ring Buffer. |
+| `GET /api/cluster` | Cliente -> `web` -> `redis` | HTTP JSON | Retorna sessões ativas por Gateway (`gateway-1` vs `gateway-2`), `seqId` atual e tamanho do Ring Buffer; ignora e limpa sessões de Gateways sem `gw:alive:*`. |
 | `http://localhost:8404` | Apresentador -> `haproxy` | HTTP (HAProxy Stats) | Painel nativo do HAProxy mostrando em tempo real conexões `leastconn` e saúde de `gateway-1` / `gateway-2`. |
-| `RPUSH / BLPOP jobs:messages` | `gateway-*` -> `redis` -> `worker-1` | Redis List | Desacopla recepção de socket do processamento de negócio (*Gateway Pattern*). |
+| `XADD / XREADGROUP / XACK stream:jobs` | `gateway-*` -> `redis` -> `worker-1` | Redis Streams | Desacopla recepção de socket do processamento de negócio (*Gateway Pattern*) com entrega *at-least-once* (`XAUTOCLAIM` recupera jobs de workers mortos). |
 | `PUBLISH / SUBSCRIBE room:main` | `worker-1` -> `redis` -> `gateway-*` | Redis Pub/Sub | Entrega broadcast entre servidores para clientes em gateways diferentes. |
 | `PUBLISH / SUBSCRIBE trace:events` | Todos os nós -> `redis` -> `web` | Redis Pub/Sub | Envia saltos reais (`from -> to`, protocolo, tempo) para animação ao vivo no frontend. |
 
@@ -161,25 +178,29 @@ sequenceDiagram
 ### Infraestrutura Docker & Banco de Dados
 
 #### [NEW] `docker-compose.yml`
-Orquestra os 7 serviços (`postgres`, `redis`, `haproxy`, `gateway-1`, `gateway-2`, `worker-1`, `web`) em rede interna `pulsews-net`, com `healthcheck` em `postgres` e `redis`, volume persistente `pgdata` e mapeamento das portas `3000` (Web + `/ws`), `8080` (HAProxy L4 direto) e `8404` (HAProxy Stats).
+Orquestra os 7 serviços (`postgres`, `redis`, `haproxy`, `gateway-1`, `gateway-2`, `worker-1`, `web`) em rede interna `pulsews-net`, com `healthcheck` em `postgres` e `redis`, `restart: unless-stopped` em todos os serviços, Redis com AOF (`--appendonly yes`), volumes persistentes `pgdata` e `redisdata` e mapeamento das portas `3000` (Web + `/ws`), `8080` (HAProxy L4 direto) e `8404` (HAProxy Stats).
 
 #### [NEW] `haproxy/haproxy.cfg`
 Configuração oficial **Layer 4 (`mode tcp`)**:
 - `frontend ws_frontend`: `bind *:8080`
-- `backend ws_gateways`: `mode tcp`, `balance leastconn`, `option tcp-check`, `server gateway-1 gateway-1:4001 check inter 3s fall 2 rise 2`, `server gateway-2 gateway-2:4002 check inter 3s fall 2 rise 2`
+- `backend ws_gateways`: `mode tcp`, `balance leastconn`, `retries 3`, `option redispatch`, `option httpchk` com `http-check send meth GET uri /health` e `http-check expect status 200`, `default-server inter 1s fall 2 rise 1`, `server gateway-1 gateway-1:4001 check`, `server gateway-2 gateway-2:4002 check` (`timeout connect 400ms`)
 - `listen stats`: `bind *:8404`, `mode http`, `stats enable`, `stats uri /`
 
 #### [NEW] `db/init.sql`
 Cria as tabelas no PostgreSQL:
-- `messages`: `id SERIAL PRIMARY KEY`, `seq_id BIGINT UNIQUE NOT NULL`, `user_id VARCHAR(64) NOT NULL`, `content TEXT NOT NULL`, `gateway_id VARCHAR(32) NOT NULL`, `created_at TIMESTAMPTZ DEFAULT NOW()`.
+- `messages`: `id SERIAL PRIMARY KEY`, `seq_id BIGINT UNIQUE NOT NULL`, `user_id VARCHAR(64) NOT NULL`, `content TEXT NOT NULL`, `gateway_id VARCHAR(32) NOT NULL`, `client_msg_id VARCHAR(64) UNIQUE` (idempotência), `created_at TIMESTAMPTZ DEFAULT NOW()`.
 - `notifications`: `id SERIAL PRIMARY KEY`, `type VARCHAR(32) NOT NULL`, `user_id VARCHAR(64) NOT NULL`, `message TEXT NOT NULL`, `created_at TIMESTAMPTZ DEFAULT NOW()`.
+- `room_meta`: `id SMALLINT PRIMARY KEY (id = 1)`, `epoch VARCHAR(64) NOT NULL` (identifica a sala para detectar reset de estado no cliente).
 
 ---
 
 ### Pacote Compartilhado (`src/shared/`)
 
 #### [NEW] `src/shared/constants.js`
-Define chaves Redis (`session:{userId}`, `seq:room:main`, `ring:room:main`, `jobs:messages`, `room:main`, `trace:events`) e constantes (`RING_BUFFER_SIZE = 50`, `SESSION_TTL_SEC = 45`).
+Define chaves Redis (`session:{userId}`, `gw:alive:{gatewayId}`, `seq:room:main`, `ring:room:main`, `stream:jobs`, `room:main`, `room:main:epoch`, `trace:events`) e constantes (`RING_BUFFER_SIZE = 50`, `SESSION_TTL_SEC = 45`, `GW_ALIVE_TTL_SEC = 6`, `WS_MAX_PAYLOAD_BYTES = 4096`, rate limit).
+
+#### [NEW] `src/shared/clients.js`
+Helpers compartilhados e resilientes: `createRedisClient` / `createPgPool` (listeners `error` e reconexão com backoff), `scanKeys` (substitui `KEYS` por `SCAN`), `ensureDbSchema` (migração idempotente), `getOrLoadRoomEpoch` e `installProcessErrorHandlers`.
 
 #### [NEW] `src/shared/trace.js`
 Helper para publicar eventos padronizados em `trace:events` (`{ traceId, flow, step, from, to, protocol, detail, ts }`), permitindo rastrear na UI cada salto real de mensagens WebSocket, Polling e Reconexão.
@@ -191,14 +212,15 @@ Helper para publicar eventos padronizados em `trace:events` (`{ traceId, flow, s
 #### [NEW] `src/gateway/Dockerfile` & `src/gateway/package.json` & `src/gateway/src/index.js`
 **Dumb Gateway** (`ws`, `ioredis`, `pg`):
 - Aceita `?userId=...&lastSeenSeqId=...` no upgrade WebSocket.
-- Registra sessão no Redis (`SET session:{userId} {GATEWAY_ID} EX 45`) e renova no heartbeat (`ping`/`pong`).
-- Na reconexão com `lastSeenSeqId >= 0`: consulta `LRANGE ring:room:main 0 -1`; se o `lastSeenSeqId` ainda estiver coberto pelo Ring Buffer, devolve `sync` com `recoverySource: "ring_buffer"`; caso contrário, consulta o PostgreSQL (`SELECT ... WHERE seq_id > $1`) e devolve `recoverySource: "postgres_offline"`.
-- Envia comandos recebidos dos clientes para `RPUSH jobs:messages` e assina `room:main` para entregar aos sockets locais.
+- Valida `userId` (formato/tamanho) e usa `WebSocketServer` com `maxPayload` de 4 KB.
+- Registra sessão no Redis (`SET session:{userId} ... EX 45`) e a recria a cada heartbeat (`ping`/`pong`) com `SET ... EX`, recuperando sessões após reinício do Redis. Publica `gw:alive:{GATEWAY_ID}` (TTL 6 s, a cada 2 s). `GET /health` valida Redis e PostgreSQL (`200`/`503`).
+- Na reconexão com `lastSeenSeqId >= 0`: consulta `LRANGE ring:room:main 0 -1`; se o `lastSeenSeqId` ainda estiver coberto pelo Ring Buffer, devolve `sync` com `recoverySource: "ring_buffer"`; caso contrário, consulta o PostgreSQL (`SELECT ... WHERE seq_id > $1`) e devolve `recoverySource: "postgres_offline"` em páginas de 200 (`hasMore` / `sync_more`). Se o `epoch` divergir ou `lastSeenSeqId` for maior que o `seqId` atual, devolve `resetRequired: true`.
+- Valida o conteúdo (1–500 caracteres), aplica rate limit por conexão e envia comandos com `XADD stream:jobs` (com `clientMsgId`); assina `room:main` para entregar aos sockets locais e ressincroniza clientes quando o `redisSub` reconecta.
 
 #### [NEW] `src/worker/Dockerfile` & `src/worker/package.json` & `src/worker/src/index.js`
 **Smart Worker** (`ioredis`, `pg`):
-- Consome `jobs:messages` via `BLPOP` (sem derrubar conexões de clientes se o container for reiniciado!).
-- Para `chat`: incrementa `seq:room:main`, grava no `ring:room:main` (`LPUSH` + `LTRIM 0 49`), persiste em `messages` e `notifications` no PostgreSQL e publica em `room:main`.
+- Consome `stream:jobs` via `XREADGROUP` (consumer group `workers-group`), recupera pendentes no boot e com `XAUTOCLAIM`, e só confirma com `XACK` após concluir (sem derrubar conexões de clientes se o container for reiniciado!). No `SIGTERM`, aguarda o job em andamento.
+- Para `chat`: realinha `seq:room:main` com `MAX(seq_id)` quando necessário, incrementa o `seqId`, persiste em `messages` de forma idempotente (`ON CONFLICT (client_msg_id) DO NOTHING`), **só então** grava no `ring:room:main` (`LPUSH` + `LTRIM 0 49`), publica em `room:main` e faz `XACK`.
 - Para `user_joined` / `user_left`: grava notificação no PostgreSQL para o Short Polling capturar e emite trace.
 
 #### [NEW] `src/web/Dockerfile` & `src/web/package.json` & `src/web/src/index.js`
@@ -207,7 +229,7 @@ Helper para publicar eventos padronizados em `trace:events` (`{ traceId, flow, s
 - Proxy TCP no evento `upgrade` para `/ws` -> `haproxy:8080` (mantendo 1 conexão TCP por cliente para o `leastconn` e compatibilidade total com `wss://<tunnel>.trycloudflare.com/ws`).
 - WebSocket `/ws-trace` repassando `trace:events` do Redis para o diagrama animado.
 - `GET /api/notifications?afterId=0`: Short Polling no PostgreSQL + emissão de trace de Polling.
-- `GET /api/cluster`: lê chaves `session:*`, `seq:room:main` e tamanho de `ring:room:main` no Redis.
+- `GET /api/cluster`: lê chaves `session:*` com `SCAN`, descarta sessões de Gateways sem `gw:alive:*`, e retorna `seq:room:main` e tamanho de `ring:room:main`. `GET /health` valida Redis e PostgreSQL.
 
 ---
 
@@ -237,6 +259,9 @@ Interface moderna (tema escuro estilo painel de engenharia/observabilidade) divi
 #### [NEW] `package.json` (raiz) & `scripts/load-test.mjs`
 - `npm test` executa `scripts/load-test.mjs` contra `http://localhost:3000` / `ws://localhost:3000/ws`, validando balanceamento L4 (`gateway-1` e `gateway-2`), broadcast cross-gateway, `seqId` crescente, replay no Ring Buffer, Short Polling e eventos em `/ws-trace`.
 
+#### [NEW] `scripts/fault-test.mjs`
+- `npm run test:fault` injeta falhas via `docker compose` (reinício de Redis/Worker/PostgreSQL, `SIGKILL` em Worker e Gateway, payload de 5 MB e flood) e valida `B1`–`B8` e a regressão do Redis parado.
+
 #### [NEW] `README.md`
 Guia rápido de comandos (`docker compose up -d --build`, `docker compose restart worker-1`, `docker compose stop gateway-1`, `cloudflared tunnel --url http://localhost:3000`, `npm test`) e acesso ao HAProxy Stats (`http://localhost:8404`).
 
@@ -259,7 +284,11 @@ Guia rápido de comandos (`docker compose up -d --build`, `docker compose restar
    npm test
    ```
    Validando distribuição L4 `leastconn` entre `gateway-1` e `gateway-2`, troca de mensagens cross-gateway, ordenação por `seqId`, replay via `ring_buffer`, endpoint `/api/notifications` e stream `/ws-trace`.
-4. Testar resiliência do *Gateway Pattern* (Worker reinicia sem derrubar sockets):
+4. Rodar a suíte de injeção de falhas (`B1`–`B8`):
+   ```bash
+   npm run test:fault
+   ```
+5. Testar resiliência do *Gateway Pattern* (Worker reinicia sem derrubar sockets):
    ```bash
    docker compose restart worker-1
    ```
@@ -269,4 +298,5 @@ Guia rápido de comandos (`docker compose up -d --build`, `docker compose restar
 2. Enviar mensagens no chat e acompanhar no **Mapa Animado** o pacote percorrendo todos os servidores e voltando pelos dois gateways; testar o botão **"Replay Última Rota (Câmera Lenta)"**.
 3. Observar as notificações no painel **Short Polling** e o contador de requisições vazias ("fantasmas").
 4. Testar **"Simular Queda / Reconectar"** e conferir o badge de recuperação pelo **Ring Buffer**.
-5. *(Para demonstração em sala)* Testar `cloudflared tunnel --url http://localhost:3000` e abrir a URL gerada no celular para confirmar interação no chat e animação ao vivo via `wss://.../ws`.
+5. Testar reconexão automática: `docker compose kill -s SIGKILL gateway-1` e observar o navegador reconectando no `gateway-2` sem clique manual.
+6. *(Para demonstração em sala)* Testar `cloudflared tunnel --url http://localhost:3000` e abrir a URL gerada no celular para confirmar interação no chat e animação ao vivo via `wss://.../ws`.
