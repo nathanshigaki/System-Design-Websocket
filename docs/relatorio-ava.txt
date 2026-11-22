@@ -315,7 +315,7 @@ literatura tecnica destaca duas evolucoes naturais desta arquitetura:
   Dumb Gateways atras de balanceadores L4 dedicados.
 
 
-5. PROTOTIPO DA SOLUCAO (DESCRICAO DO QUE FOI FEITO)
+5. PROTOTIPO DA SOLUCAO (IMPLEMENTACAO E RESULTADOS)
 ------------------------------------------------------------------------
 O prototipo pratico contempla a implementacao completa dos sete nos
 descritos na Secao 4 por meio de Docker Compose (docker-compose.yml,
@@ -401,12 +401,17 @@ parado temporariamente enquanto um cliente envia mensagem.
   npm run test:fault               (injecao de falhas B1 a B8)
 Interface: http://localhost:3000 | HAProxy Stats: http://localhost:8404
 
-[INSERIR PRINTS AQUI APOS A EXECUCAO:
-  - Saida do comando docker compose ps (7 containers em execucao);
-  - Chat com usuarios em gateway-1 e gateway-2, mapa animado das rotas e
-    painel de Sessoes no Cluster;
-  - HAProxy Stats (:8404) com os dois Gateways em verde;
-  - Terminal com o resultado de npm test e npm run test:fault.]
+5.4 Evidencias de Execucao e Capturas de Tela
+As capturas reais geradas com o ambiente em execucao estao em docs/prints/
+e incorporadas no relatorio-ava.docx:
+  - docs/prints/01-docker-ps.png: saida de docker compose ps (7 servicos);
+  - docs/prints/02-ui-chat-cluster.png: interface web redesenhada (chat,
+    avatares interativos, Short Polling e Sessoes no Cluster);
+  - docs/prints/03-ui-mapa-rotas.png: mapa animado ao vivo das rotas SVG;
+  - docs/prints/04-haproxy-stats.png: HAProxy Stats (:8404) com gateway-1
+    e gateway-2 ativos e health check HTTP L7OK/200;
+  - docs/prints/05-testes-terminal.png: terminal com npm test e
+    npm run test:fault (B1 a B8 + regressao 100% aprovados).
 
 
 6. CONCLUSAO
