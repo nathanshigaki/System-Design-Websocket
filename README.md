@@ -9,12 +9,12 @@ Protótipo funcional desenvolvido para a disciplina de **Sistemas Distribuídos*
 | Serviço | Tecnologia | Porta | Função |
 | :--- | :--- | :--- | :--- |
 | `web` | Node.js 24 (`node:http`, `ws`, `ioredis`, `pg`) | `3000` | UI interativa com SVG animado, proxy TCP `/ws -> haproxy:8080`, `/ws-trace` e Short Polling (`/api/notifications`) |
-| `haproxy` | HAProxy 2.9 (`mode tcp`, `leastconn`) | `8080` / `8404` | Load Balancer Layer 4 (TCP passthrough) + painel Stats na `:8404` |
-| `gateway-1` | Node.js 24 (`ws`, `ioredis`, `pg`) | `4001` (interna) | Dumb Gateway 1 (conexões WS, Session Manager, heartbeat, replay Ring Buffer/SQL) |
+| `haproxy` | HAProxy 2.9 (`mode tcp`, `leastconn`) | `8080` / `8404` | Load Balancer Layer 4 (TCP passthrough), health check HTTP `/health`, `retries 3` + `redispatch` e painel Stats na `:8404` |
+| `gateway-1` | Node.js 24 (`ws`, `ioredis`, `pg`) | `4001` (interna) | Dumb Gateway 1 (conexões WS, Session Manager, `gw:alive`, `maxPayload` 4 KB, rate limit, `XADD`, replay Ring Buffer/SQL paginado) |
 | `gateway-2` | Node.js 24 (`ws`, `ioredis`, `pg`) | `4002` (interna) | Dumb Gateway 2 (escala horizontal e failover) |
-| `worker-1` | Node.js 24 (`ioredis`, `pg`) | interna | Smart Worker (*Single-Writer*: regra da sala, `seqId`, Ring Buffer, PostgreSQL e Pub/Sub) |
-| `redis` | Redis 7 Alpine | `6379` (interna) | Session Manager, Fila `jobs:messages`, `seqId`, Ring Buffer (50 msgs) e Pub/Sub (`room:main`, `trace:events`) |
-| `postgres` | PostgreSQL 16 Alpine | `5432` (interna) | Persistência durável (`messages` e `notifications`) |
+| `worker-1` | Node.js 24 (`ioredis`, `pg`) | interna | Smart Worker (*Single-Writer*: consome Redis Streams, `seqId`, PostgreSQL idempotente, Ring Buffer, Pub/Sub e `XACK`) |
+| `redis` | Redis 7 Alpine | `6379` (interna) | Session Manager, fila durável (Redis Streams `stream:jobs`), `seqId`, Ring Buffer (50 msgs), Pub/Sub (`room:main`, `trace:events`) e persistência AOF |
+| `postgres` | PostgreSQL 16 Alpine | `5432` (interna) | Persistência durável (`messages` com `client_msg_id`, `notifications` e `room_meta`) |
 
 ## Pré-requisitos
 
@@ -41,7 +41,8 @@ Protótipo funcional desenvolvido para a disciplina de **Sistemas Distribuídos*
 Na raiz do repositório:
 ```bash
 npm install
-npm test
+npm test            # validação funcional (L4, cross-gateway, Ring Buffer, Polling)
+npm run test:fault  # injeção de falhas B1-B8 (reinicia/mata containers via docker compose)
 ```
 
 ## Roteiro de Testes Ao Vivo (Apresentação)
@@ -55,6 +56,10 @@ npm test
   docker compose stop gateway-1
   ```
   *(Para religar depois: `docker compose start gateway-1`)*
+- **Matar um Gateway à força e ver o navegador reconectar sozinho:**
+  ```bash
+  docker compose kill -s SIGKILL gateway-1
+  ```
 - **Expor gratuitamente na internet para os celulares da turma:**
   ```bash
   cloudflared tunnel --url http://localhost:3000
